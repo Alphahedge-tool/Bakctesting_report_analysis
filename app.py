@@ -117,10 +117,14 @@ def parse_trades(uploaded) -> pd.DataFrame:
         return frame[BASE_COLUMNS].copy()
 
     current_date = None
+    primary_portfolio = None
     current_market = {column: float("nan") for column in MARKET_COLUMNS}
     trades = []
     for row in rows:
         row = list(row) + [""] * max(0, 15 - len(row))
+        if str(row[0]).strip() == "Portfolios" and str(row[1]).strip():
+            primary_portfolio = str(row[1]).strip()
+            continue
         if str(row[0]).strip() == "Date" and row[1]:
             value = row[1]
             if isinstance(value, datetime):
@@ -134,7 +138,7 @@ def parse_trades(uploaded) -> pd.DataFrame:
         # The first OTM2 summary row contains the day's primary market context.
         # Re-entry summary rows have their own intraday VIX windows, but all legs
         # are deliberately classified using the original day's VIX start/end.
-        if current_date and portfolio == "OTM2 2023" and not leg.lower().startswith("leg") and row[9] != "":
+        if current_date and portfolio == primary_portfolio and not leg.lower().startswith("leg") and row[9] != "":
             vix_start = _first_number(row[9])
             vix_end = _first_number(row[10])
             current_market = {
@@ -146,7 +150,7 @@ def parse_trades(uploaded) -> pd.DataFrame:
                 "Gap Change %": _percent_in_parentheses(row[7]),
             }
             continue
-        if current_date and portfolio.startswith("OTM2") and leg.lower().startswith("leg"):
+        if current_date and primary_portfolio and portfolio.startswith(primary_portfolio) and leg.lower().startswith("leg"):
             strike = str(row[4]).strip()
             trades.append({
                 "Date": current_date, "Portfolio": portfolio, "Leg": leg,
