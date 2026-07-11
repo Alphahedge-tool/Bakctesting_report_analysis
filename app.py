@@ -446,6 +446,13 @@ c2.metric("Trade legs", f"{detail.shape[0]:,}", help=f"Across {portfolio_count} 
 c3.metric("Premium turnover", MONEY.format(total["Premium Turnover"]))
 c4.metric("Total brokerage", MONEY.format(total["Total Brokerage (Including All Charges)"]))
 c5.metric("Net P&L", MONEY.format(total["Net P&L After Charges"]))
+selected_brokerage = total["Zerodha Brokerage"]
+selected_all_charges = total["Total Brokerage (Including All Charges)"]
+selected_other_charges = selected_all_charges - selected_brokerage
+sc1, sc2, sc3 = st.columns(3)
+sc1.metric("Zerodha brokerage", MONEY.format(selected_brokerage), help="₹20 × executed option orders")
+sc2.metric("Other charges", MONEY.format(selected_other_charges), help="STT + NSE + SEBI + stamp duty + GST")
+sc3.metric("All charges", MONEY.format(selected_all_charges), help="Zerodha brokerage + all other charges")
 
 if len(comparison_results) == 2:
     st.markdown("## Side-by-side comparison")
