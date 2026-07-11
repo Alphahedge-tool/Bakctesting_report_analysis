@@ -354,6 +354,8 @@ if len(comparison_results) > 1:
             "Orders": int(file_total["Executed Orders"]),
             "Premium Turnover": file_total["Premium Turnover"],
             "Gross MTM / P&L": file_total["Gross P&L"],
+            "Zerodha Brokerage": file_total["Zerodha Brokerage"],
+            "Other Charges": file_total["Total Brokerage (Including All Charges)"] - file_total["Zerodha Brokerage"],
             "Total Charges": file_total["Total Brokerage (Including All Charges)"],
             "Net P&L": file_total["Net P&L After Charges"],
             "Winning Days": len(winning),
@@ -376,6 +378,8 @@ if len(comparison_results) > 1:
     st.markdown("## All-files portfolio analysis")
     grand_turnover = all_summary["Premium Turnover"].sum()
     grand_charges = all_summary["Total Charges"].sum()
+    grand_brokerage = all_summary["Zerodha Brokerage"].sum()
+    grand_other_charges = all_summary["Other Charges"].sum()
     grand_gross = all_summary["Gross MTM / P&L"].sum()
     grand_net = all_summary["Net P&L"].sum()
     ac1, ac2, ac3, ac4, ac5 = st.columns(5)
@@ -384,10 +388,14 @@ if len(comparison_results) > 1:
     ac3.metric("Combined gross MTM", MONEY.format(grand_gross))
     ac4.metric("Combined charges", MONEY.format(grand_charges))
     ac5.metric("Combined net P&L", MONEY.format(grand_net))
+    bc1, bc2, bc3 = st.columns(3)
+    bc1.metric("Zerodha brokerage", MONEY.format(grand_brokerage), help="₹20 × total executed option orders")
+    bc2.metric("Other charges", MONEY.format(grand_other_charges), help="STT + NSE + SEBI + stamp duty + GST")
+    bc3.metric("All combined charges", MONEY.format(grand_charges), help="Zerodha brokerage + all other charges")
 
     portfolio_tab, monthly_tab, vix_portfolio_tab = st.tabs(["Dataset scorecard", "Monthly MTM", "Combined VIX"])
     with portfolio_tab:
-        score_money = ["Premium Turnover", "Gross MTM / P&L", "Total Charges", "Net P&L", "Best Day", "Worst Day", "Max Drawdown"]
+        score_money = ["Premium Turnover", "Gross MTM / P&L", "Zerodha Brokerage", "Other Charges", "Total Charges", "Net P&L", "Best Day", "Worst Day", "Max Drawdown"]
         st.dataframe(
             all_summary.style.format({
                 **{column: "₹{:,.2f}" for column in score_money},
@@ -401,6 +409,11 @@ if len(comparison_results) > 1:
         score_fig.add_trace(go.Bar(x=all_summary["Dataset"], y=all_summary["Total Charges"], name="Charges", marker_color="#f59e0b"))
         score_fig.update_layout(title="Net P&L and charges by dataset", barmode="group", template="plotly_white", height=400, margin=dict(l=20,r=20,t=55,b=80), xaxis_tickangle=-20)
         st.plotly_chart(score_fig, width="stretch")
+        charge_split_fig = go.Figure()
+        charge_split_fig.add_trace(go.Bar(x=all_summary["Dataset"], y=all_summary["Zerodha Brokerage"], name="Zerodha brokerage", marker_color="#2563eb"))
+        charge_split_fig.add_trace(go.Bar(x=all_summary["Dataset"], y=all_summary["Other Charges"], name="Other charges", marker_color="#f59e0b"))
+        charge_split_fig.update_layout(title="Brokerage versus all other charges", barmode="stack", template="plotly_white", height=390, margin=dict(l=20,r=20,t=55,b=80), xaxis_tickangle=-20)
+        st.plotly_chart(charge_split_fig, width="stretch")
     with monthly_tab:
         combined_monthly = combined_daily.copy()
         combined_monthly["Month"] = combined_monthly["Date"].dt.to_period("M").astype(str)
