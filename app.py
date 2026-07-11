@@ -205,6 +205,20 @@ def calculate(detail: pd.DataFrame, brokerage, stt, exchange, sebi, stamp, gst):
     return d, daily[order]
 
 
+def regime_summary(frame: pd.DataFrame, category: str) -> pd.DataFrame:
+    summary = frame.groupby(category, dropna=False).agg(
+        Days=("Date", "count"),
+        Gross_PnL=("Gross P&L", "sum"),
+        Charges=("Total Brokerage (Including All Charges)", "sum"),
+        Net_PnL=("Net P&L After Charges", "sum"),
+        Average_Net_PnL=("Net P&L After Charges", "mean"),
+    ).reset_index()
+    win_rates = frame.groupby(category, dropna=False)["Net P&L After Charges"].apply(
+        lambda values: (values > 0).mean() * 100
+    ).reset_index(name="Win Rate %")
+    return summary.merge(win_rates, on=category, how="left")
+
+
 def excel_bytes(detail, daily, rates):
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl", datetime_format="dd-mmm-yyyy") as writer:
@@ -315,6 +329,32 @@ with st.sidebar:
             selected_underlying_min = st.number_input("Min underlying change", value=underlying_low, step=10.0, format="%.2f")
         with uc2:
             selected_underlying_max = st.number_input("Max underlying change", value=underlying_high, step=10.0, format="%.2f")
+        absolute_moves = full_daily["Underlying Change"].abs().dropna()
+        default_range_threshold = float(absolute_moves.quantile(0.35)) if len(absolute_moves) else 50.0
+        default_large_threshold = float(absolute_moves.quantile(0.70)) if len(absolute_moves) else 100.0
+        regime_range_threshold = st.number_input(
+            "Range-bound threshold (points)", value=default_range_threshold, min_value=0.0,
+            step=5.0, format="%.2f", help="Absolute underlying change at or below this value is classified as range-bound.",
+        )
+        large_move_threshold = st.number_input(
+            "Large movement threshold (points)", value=default_large_threshold, min_value=0.0,
+            step=5.0, format="%.2f", help="Absolute underlying change above this value is classified as large.",
+        )
+        full_daily["VIX Change"] = full_daily["VIX End"] - full_daily["VIX Start"]
+        full_daily["VIX Change %"] = full_daily["VIX Change"].div(full_daily["VIX Start"]).mul(100)
+        full_daily["VIX Direction"] = full_daily["VIX Change"].apply(
+            lambda value: "VIX Rising" if value > 0.01 else ("VIX Falling" if value < -0.01 else "VIX Flat")
+        )
+        full_daily["Gap Direction"] = full_daily["Gap Change"].apply(
+            lambda value: "Gap Up" if value > 0 else ("Gap Down" if value < 0 else "Flat Open")
+        )
+        full_daily["Underlying Movement"] = full_daily["Underlying Change"].abs()
+        full_daily["Market Regime"] = full_daily["Underlying Movement"].apply(
+            lambda value: "Range-bound" if value <= regime_range_threshold else "Trending"
+        )
+        full_daily["Movement Size"] = full_daily["Underlying Movement"].apply(
+            lambda value: "Small movement" if value <= large_move_threshold else "Large movement"
+        )
         filter_mask = (
             full_daily[vix_basis].between(selected_vix_min, selected_vix_max, inclusive="both")
             & full_daily["Underlying Change"].between(selected_underlying_min, selected_underlying_max, inclusive="both")
@@ -517,7 +557,7 @@ if len(comparison_results) == 2:
             )
 
 st.caption(f"Filtered result · {len(daily)} of {len(full_daily)} days · {detail.shape[0]} trade legs")
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["Overview", "VIX analysis", "Daily breakdown", "Trade legs", "Charges audit"])
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["Overview", "VIX analysis", "Market regimes", "Daily breakdown", "Trade legs", "Charges audit"])
 with tab1:
     left, right = st.columns([1.6, 1])
     with left:
@@ -578,19 +618,84 @@ with tab2:
     )
 
 with tab3:
+    if not market_available:
+        st.warning("Upload the original MT Quant CSV to analyse market regimes.")
+    else:
+        st.subheader("Market-condition performance")
+        st.caption(
+            f"Current definitions: range-bound ≤ {regime_range_threshold:.2f} points; "
+            f"large movement > {large_move_threshold:.2f} points. Change these thresholds in the sidebar."
+        )
+        regime_specs = [
+            ("VIX Direction", "VIX rising versus falling"),
+            ("Gap Direction", "Gap-up versus gap-down"),
+            ("Market Regime", "Trending versus range-bound"),
+            ("Movement Size", "Large versus small underlying movement"),
+        ]
+        regime_columns = st.columns(2, gap="large")
+        for index, (category, title) in enumerate(regime_specs):
+            with regime_columns[index % 2]:
+                st.markdown(f"#### {title}")
+                regime_view = regime_summary(daily, category)
+                st.dataframe(
+                    regime_view.style.format({
+                        "Gross_PnL": "₹{:,.2f}", "Charges": "₹{:,.2f}",
+                        "Net_PnL": "₹{:,.2f}", "Average_Net_PnL": "₹{:,.2f}",
+                        "Win Rate %": "{:.1f}%",
+                    }),
+                    width="stretch", hide_index=True,
+                )
+                regime_chart = go.Figure(go.Bar(
+                    x=regime_view[category].astype(str), y=regime_view["Net_PnL"],
+                    marker_color=["#2563eb" if value >= 0 else "#ef4444" for value in regime_view["Net_PnL"]],
+                    text=[f"₹{value:,.0f}" for value in regime_view["Net_PnL"]], textposition="auto",
+                ))
+                regime_chart.add_hline(y=0, line_color="#94a3b8")
+                regime_chart.update_layout(template="plotly_white", height=300, margin=dict(l=10,r=10,t=20,b=45), showlegend=False)
+                st.plotly_chart(regime_chart, width="stretch")
+
+        st.markdown("#### VIX percentage-change analysis")
+        vix_change_left, vix_change_right = st.columns([1.3, 1])
+        with vix_change_left:
+            vix_change_chart = go.Figure(go.Scatter(
+                x=daily["VIX Change %"], y=daily["Net P&L After Charges"], mode="markers",
+                text=daily["Date"].dt.strftime("%d-%b-%Y"),
+                marker=dict(size=11, color=daily["Underlying Movement"], colorscale="Viridis", colorbar=dict(title="Absolute<br>move")),
+                hovertemplate="%{text}<br>VIX change: %{x:+.2f}%<br>Net P&L: ₹%{y:,.2f}<extra></extra>",
+            ))
+            vix_change_chart.add_vline(x=0, line_dash="dot", line_color="#94a3b8")
+            vix_change_chart.add_hline(y=0, line_dash="dot", line_color="#94a3b8")
+            vix_change_chart.update_layout(template="plotly_white", height=420, margin=dict(l=20,r=20,t=30,b=50), xaxis_title="VIX change %", yaxis_title="Net P&L after charges")
+            st.plotly_chart(vix_change_chart, width="stretch")
+        with vix_change_right:
+            condition_dates = daily[[
+                "Date", "VIX Start", "VIX End", "VIX Change %", "VIX Direction",
+                "Gap Direction", "Market Regime", "Movement Size", "Underlying Change",
+                "Net P&L After Charges",
+            ]].copy()
+            condition_dates["Date"] = condition_dates["Date"].dt.strftime("%d-%b-%Y")
+            st.dataframe(
+                condition_dates.style.format({
+                    "VIX Start": "{:.2f}", "VIX End": "{:.2f}", "VIX Change %": "{:+.2f}%",
+                    "Underlying Change": "{:+,.2f}", "Net P&L After Charges": "₹{:,.2f}",
+                }),
+                width="stretch", height=420, hide_index=True,
+            )
+
+with tab4:
     display_daily = daily.copy()
     display_daily["Date"] = display_daily["Date"].dt.strftime("%d-%b-%Y")
     money_cols = [c for c in display_daily.columns if any(term in c for term in ["Premium", "P&L", "Brokerage", "STT", "Transaction Charges", "SEBI Charges", "Stamp Duty", "GST"])]
     st.dataframe(display_daily.style.format({c: "₹{:,.2f}" for c in money_cols}), width="stretch", height=540, hide_index=True)
 
-with tab4:
+with tab5:
     portfolios = sorted(detail["Portfolio"].unique())
     selected = st.multiselect("Portfolio blocks", portfolios, default=portfolios)
     filtered = detail[detail["Portfolio"].isin(selected)].copy()
     filtered["Date"] = filtered["Date"].dt.strftime("%d-%b-%Y")
     st.dataframe(filtered, width="stretch", height=560, hide_index=True)
 
-with tab5:
+with tab6:
     audit = pd.DataFrame({
         "Charge": ["Zerodha brokerage", "STT", "NSE transaction charges", "SEBI charges", "Stamp duty", "GST", "FINAL TOTAL"],
         "Calculation basis": ["Executed orders × rate", "Sell premium value", "Buy + sell premium turnover", "Buy + sell premium turnover", "Buy premium value", "Brokerage + NSE + SEBI", "Sum of every charge"],
@@ -606,6 +711,8 @@ rates = {
     "Stamp duty % on buy premium": stamp_rate, "GST %": gst_rate,
     "Applied VIX filter": f"{selected_vix_min:.2f} to {selected_vix_max:.2f} ({vix_basis})" if market_available else "Not available",
     "Applied underlying-change filter": f"{selected_underlying_min:.2f} to {selected_underlying_max:.2f}" if market_available else "Not available",
+    "Range-bound threshold": f"{regime_range_threshold:.2f} points" if market_available else "Not available",
+    "Large-movement threshold": f"{large_move_threshold:.2f} points" if market_available else "Not available",
     "Included trading days": len(daily),
 }
 download = excel_bytes(detail, daily, rates)
