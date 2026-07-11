@@ -65,6 +65,8 @@ CORE_COLUMNS = [
 ]
 MARKET_COLUMNS = ["VIX Start", "VIX End", "VIX Average", "Underlying Change", "Gap Change", "Gap Change %"]
 BASE_COLUMNS = CORE_COLUMNS + MARKET_COLUMNS
+VIX_BINS = [0, 12, 15, 18, 22, float("inf")]
+VIX_BAND_LABELS = ["Very Low · Below 12", "Low · 12–15", "Medium · 15–18", "High · 18–22", "Very High · Above 22"]
 
 
 def _first_number(value, default=float("nan")):
@@ -337,6 +339,26 @@ if len(comparison_results) == 2:
             pn1.metric("Total charges", MONEY.format(compare_total["Total Brokerage (Including All Charges)"]))
             pn2.metric("Net P&L", MONEY.format(compare_total["Net P&L After Charges"]))
 
+            st.markdown("#### India VIX comparison")
+            vx1, vx2, vx3 = st.columns(3)
+            vx1.metric("Minimum VIX", f"{compare_daily['VIX Start'].min():.2f}")
+            vx2.metric("Average VIX", f"{compare_daily['VIX Start'].mean():.2f}")
+            vx3.metric("Maximum VIX", f"{compare_daily['VIX Start'].max():.2f}")
+            compare_bands = pd.cut(
+                compare_daily["VIX Start"], bins=VIX_BINS, labels=VIX_BAND_LABELS, right=False
+            )
+            compare_vix_table = compare_daily.assign(**{"VIX Band": compare_bands}).groupby(
+                "VIX Band", observed=False
+            ).agg(
+                Days=("Date", "count"),
+                Charges=("Total Brokerage (Including All Charges)", "sum"),
+                Net_PnL=("Net P&L After Charges", "sum"),
+            ).reset_index()
+            st.dataframe(
+                compare_vix_table.style.format({"Charges": "₹{:,.2f}", "Net_PnL": "₹{:,.2f}"}),
+                width="stretch", hide_index=True,
+            )
+
             compare_charge_view = pd.DataFrame({
                 "Charge": ["Brokerage", "STT", "NSE", "SEBI", "Stamp", "GST", "TOTAL"],
                 "Amount": [
@@ -393,8 +415,8 @@ with tab2:
         scatter.update_layout(title="VIX versus net P&L", template="plotly_white", height=430, margin=dict(l=20,r=20,t=55,b=20), xaxis_title="India VIX start", yaxis_title="Net P&L after charges")
         st.plotly_chart(scatter, width="stretch")
     with vright:
-        band_labels = ["Very Low · Below 12", "Low · 12–15", "Medium · 15–18", "High · 18–22", "Very High · Above 22"]
-        bands = pd.cut(full_daily["VIX Start"], bins=[0, 12, 15, 18, 22, float("inf")], labels=band_labels, right=False)
+        band_labels = VIX_BAND_LABELS
+        bands = pd.cut(full_daily["VIX Start"], bins=VIX_BINS, labels=band_labels, right=False)
         band_view = full_daily.assign(**{"VIX Band": bands}).groupby("VIX Band", observed=True).agg(
             Days=("Date", "count"), Gross_PnL=("Gross P&L", "sum"), Charges=("Total Brokerage (Including All Charges)", "sum"), Net_PnL=("Net P&L After Charges", "sum")
         ).reset_index()
