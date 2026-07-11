@@ -433,7 +433,9 @@ if len(comparison_results) > 1:
     bc2.metric("Other charges", MONEY.format(grand_other_charges), help="STT + NSE + SEBI + stamp duty + GST")
     bc3.metric("All combined charges", MONEY.format(grand_charges), help="Zerodha brokerage + all other charges")
 
-    portfolio_tab, monthly_tab, vix_portfolio_tab = st.tabs(["Dataset scorecard", "Monthly MTM", "Combined VIX"])
+    portfolio_tab, monthly_tab, vix_portfolio_tab, regime_portfolio_tab = st.tabs([
+        "Dataset scorecard", "Monthly MTM", "Combined VIX", "Market-regime comparison"
+    ])
     with portfolio_tab:
         score_money = ["Premium Turnover", "Gross MTM / P&L", "Zerodha Brokerage", "Other Charges", "Total Charges", "Net P&L", "Best Day", "Worst Day", "Max Drawdown"]
         st.dataframe(
@@ -478,6 +480,75 @@ if len(comparison_results) > 1:
             vix_fig.add_trace(go.Bar(x=vix_group["VIX Band"].astype(str), y=vix_group["Net_PnL"], name=dataset_name))
         vix_fig.update_layout(title="Net P&L by VIX band and dataset", barmode="group", template="plotly_white", height=430, margin=dict(l=20,r=20,t=55,b=70))
         st.plotly_chart(vix_fig, width="stretch")
+    with regime_portfolio_tab:
+        if not market_available:
+            st.warning("Upload original MT Quant CSV exports to compare market regimes.")
+        else:
+            regime_data = combined_daily.copy()
+            regime_data["VIX Change"] = regime_data["VIX End"] - regime_data["VIX Start"]
+            regime_data["VIX Change %"] = regime_data["VIX Change"].div(regime_data["VIX Start"]).mul(100)
+            regime_data["VIX Direction"] = regime_data["VIX Change"].apply(
+                lambda value: "VIX Rising" if value > 0.01 else ("VIX Falling" if value < -0.01 else "VIX Flat")
+            )
+            regime_data["Gap Direction"] = regime_data["Gap Change"].apply(
+                lambda value: "Gap Up" if value > 0 else ("Gap Down" if value < 0 else "Flat Open")
+            )
+            regime_data["Underlying Movement"] = regime_data["Underlying Change"].abs()
+            regime_data["Market Regime"] = regime_data["Underlying Movement"].apply(
+                lambda value: "Range-bound" if value <= regime_range_threshold else "Trending"
+            )
+            regime_data["Movement Size"] = regime_data["Underlying Movement"].apply(
+                lambda value: "Small movement" if value <= large_move_threshold else "Large movement"
+            )
+            regime_choices = {
+                "VIX rising versus falling": "VIX Direction",
+                "Gap-up versus gap-down": "Gap Direction",
+                "Trending versus range-bound": "Market Regime",
+                "Large versus small movement": "Movement Size",
+            }
+            selected_regime_name = st.selectbox("Choose a market regime to compare", list(regime_choices))
+            selected_regime_column = regime_choices[selected_regime_name]
+            comparison_table = regime_data.groupby(["Dataset", selected_regime_column], dropna=False).agg(
+                Days=("Date", "count"),
+                Gross_PnL=("Gross P&L", "sum"),
+                Charges=("Total Brokerage (Including All Charges)", "sum"),
+                Net_PnL=("Net P&L After Charges", "sum"),
+                Average_Net_PnL=("Net P&L After Charges", "mean"),
+            ).reset_index()
+            comparison_wins = regime_data.groupby(["Dataset", selected_regime_column], dropna=False)["Net P&L After Charges"].apply(
+                lambda values: (values > 0).mean() * 100
+            ).reset_index(name="Win Rate %")
+            comparison_table = comparison_table.merge(
+                comparison_wins, on=["Dataset", selected_regime_column], how="left"
+            )
+            st.dataframe(
+                comparison_table.style.format({
+                    "Gross_PnL": "₹{:,.2f}", "Charges": "₹{:,.2f}", "Net_PnL": "₹{:,.2f}",
+                    "Average_Net_PnL": "₹{:,.2f}", "Win Rate %": "{:.1f}%",
+                }),
+                width="stretch", height=420, hide_index=True,
+            )
+            regime_compare_fig = go.Figure()
+            for dataset_name, dataset_group in comparison_table.groupby("Dataset"):
+                regime_compare_fig.add_trace(go.Bar(
+                    x=dataset_group[selected_regime_column].astype(str), y=dataset_group["Net_PnL"],
+                    name=dataset_name,
+                ))
+            regime_compare_fig.add_hline(y=0, line_color="#94a3b8")
+            regime_compare_fig.update_layout(
+                title=f"Strategy profit comparison · {selected_regime_name}", barmode="group",
+                template="plotly_white", height=450, margin=dict(l=20,r=20,t=55,b=70),
+                yaxis_title="Net P&L after charges",
+            )
+            st.plotly_chart(regime_compare_fig, width="stretch")
+            profit_pivot = comparison_table.pivot(
+                index="Dataset", columns=selected_regime_column, values="Net_PnL"
+            ).reset_index()
+            st.markdown("#### Net-profit matrix")
+            st.dataframe(
+                profit_pivot.style.format({column: "₹{:,.2f}" for column in profit_pivot.columns if column != "Dataset"}),
+                width="stretch", hide_index=True,
+            )
 
 st.markdown(f"## Detailed analysis · {active_label}")
 c1, c2, c3, c4, c5 = st.columns(5)
