@@ -241,6 +241,19 @@ def vix_regime_summary(
         net_pnl = float(band_frame["Net P&L After Charges"].sum()) if trade_legs else 0.0
         win_legs = int((band_frame["Net P&L After Charges"] > 0).sum()) if trade_legs else 0
         loss_legs = int((band_frame["Net P&L After Charges"] < 0).sum()) if trade_legs else 0
+        if trade_legs:
+            day_summary = band_frame.groupby("Date", as_index=False)["Net P&L After Charges"].sum()
+            best_day_row = day_summary.loc[day_summary["Net P&L After Charges"].idxmax()]
+            worst_day_row = day_summary.loc[day_summary["Net P&L After Charges"].idxmin()]
+            best_day = best_day_row["Date"].strftime("%d-%b-%Y")
+            worst_day = worst_day_row["Date"].strftime("%d-%b-%Y")
+            best_day_pnl = float(best_day_row["Net P&L After Charges"])
+            worst_day_pnl = float(worst_day_row["Net P&L After Charges"])
+        else:
+            best_day = "No trades"
+            worst_day = "No trades"
+            best_day_pnl = float("nan")
+            worst_day_pnl = float("nan")
         if net_pnl > 0:
             result = "Profit"
         elif net_pnl < 0:
@@ -255,6 +268,10 @@ def vix_regime_summary(
             "Gross P&L": gross_pnl,
             "Charges": charges,
             "Net P&L": net_pnl,
+            "Best Day": best_day,
+            "Best Day P&L": best_day_pnl,
+            "Worst Day": worst_day,
+            "Worst Day P&L": worst_day_pnl,
             "Result": result,
         })
     return pd.DataFrame(rows)
@@ -844,6 +861,8 @@ with tab5:
                 "Gross P&L": MONEY,
                 "Charges": MONEY,
                 "Net P&L": MONEY,
+                "Best Day P&L": MONEY,
+                "Worst Day P&L": MONEY,
             }),
             width="stretch",
             hide_index=True,
