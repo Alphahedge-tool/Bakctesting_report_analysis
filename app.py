@@ -223,6 +223,37 @@ def regime_summary(frame: pd.DataFrame, category: str) -> pd.DataFrame:
     return summary.merge(win_rates, on=category, how="left")
 
 
+def _trade_label(row: pd.Series) -> str:
+    return f"{row['Date'].strftime('%d-%b-%Y')} · {row['Portfolio']} · {row['Leg']}"
+
+
+def vix_regime_extremes(frame: pd.DataFrame, band_column: str = "VIX Band") -> pd.DataFrame:
+    rows = []
+    for band in VIX_BAND_LABELS:
+        band_frame = frame[frame[band_column].astype(str) == band]
+        if band_frame.empty:
+            rows.append({
+                "VIX Band": band,
+                "Trade Legs": 0,
+                "Highest Profit Trade": "No trades",
+                "Highest Profit Net P&L": float("nan"),
+                "Highest Loss Trade": "No trades",
+                "Highest Loss Net P&L": float("nan"),
+            })
+            continue
+        best = band_frame.loc[band_frame["Net P&L After Charges"].idxmax()]
+        worst = band_frame.loc[band_frame["Net P&L After Charges"].idxmin()]
+        rows.append({
+            "VIX Band": band,
+            "Trade Legs": len(band_frame),
+            "Highest Profit Trade": _trade_label(best),
+            "Highest Profit Net P&L": float(best["Net P&L After Charges"]),
+            "Highest Loss Trade": _trade_label(worst),
+            "Highest Loss Net P&L": float(worst["Net P&L After Charges"]),
+        })
+    return pd.DataFrame(rows)
+
+
 def excel_bytes(detail, daily, rates):
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl", datetime_format="dd-mmm-yyyy") as writer:
@@ -787,9 +818,32 @@ with tab5:
     selected = st.multiselect("Portfolio blocks", portfolios, default=portfolios)
     filtered = detail[detail["Portfolio"].isin(selected)].copy()
     if market_available:
-        st.caption("Trade logs include VIX Band, VIX Start, and VIX End so you can audit low- and high-VIX trades directly.")
+        filtered["VIX Band"] = _vix_band(filtered, vix_basis)
+        st.caption("Trade logs now include an in-tab VIX filter, plus the biggest win and biggest loss inside each VIX regime.")
+        regime_extremes = vix_regime_extremes(filtered)
+        st.markdown("#### VIX regime extremes")
+        st.dataframe(
+            regime_extremes.style.format({
+                "Highest Profit Net P&L": "₹{:,.2f}",
+                "Highest Loss Net P&L": "₹{:,.2f}",
+            }),
+            width="stretch",
+            hide_index=True,
+        )
+        trade_vix_band = st.selectbox("Filter trade logs by VIX band", ["All VIX bands", *VIX_BAND_LABELS], index=0)
+        if trade_vix_band != "All VIX bands":
+            filtered = filtered[filtered["VIX Band"].astype(str) == trade_vix_band]
     filtered["Date"] = filtered["Date"].dt.strftime("%d-%b-%Y")
-    st.dataframe(filtered, width="stretch", height=560, hide_index=True)
+    money_cols = [
+        column for column in filtered.columns
+        if any(term in column for term in ["Premium", "P&L", "Brokerage", "STT", "Transaction Charges", "SEBI Charges", "Stamp Duty", "GST"])
+    ]
+    st.dataframe(
+        filtered.style.format({column: "₹{:,.2f}" for column in money_cols}),
+        width="stretch",
+        height=560,
+        hide_index=True,
+    )
 
 with tab6:
     audit = pd.DataFrame({
