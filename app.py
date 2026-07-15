@@ -227,29 +227,35 @@ def _trade_label(row: pd.Series) -> str:
     return f"{row['Date'].strftime('%d-%b-%Y')} · {row['Portfolio']} · {row['Leg']}"
 
 
-def vix_regime_extremes(frame: pd.DataFrame, band_column: str = "VIX Band") -> pd.DataFrame:
+def vix_regime_summary(
+    frame: pd.DataFrame,
+    band_column: str = "VIX Band",
+    bands: list[str] | None = None,
+) -> pd.DataFrame:
     rows = []
-    for band in VIX_BAND_LABELS:
+    for band in (bands if bands is not None else VIX_BAND_LABELS):
         band_frame = frame[frame[band_column].astype(str) == band]
-        if band_frame.empty:
-            rows.append({
-                "VIX Band": band,
-                "Trade Legs": 0,
-                "Highest Profit Trade": "No trades",
-                "Highest Profit Net P&L": float("nan"),
-                "Highest Loss Trade": "No trades",
-                "Highest Loss Net P&L": float("nan"),
-            })
-            continue
-        best = band_frame.loc[band_frame["Net P&L After Charges"].idxmax()]
-        worst = band_frame.loc[band_frame["Net P&L After Charges"].idxmin()]
+        trade_legs = len(band_frame)
+        gross_pnl = float(band_frame["Gross P&L"].sum()) if trade_legs else 0.0
+        charges = float(band_frame["Total Brokerage (Including All Charges)"].sum()) if trade_legs else 0.0
+        net_pnl = float(band_frame["Net P&L After Charges"].sum()) if trade_legs else 0.0
+        win_legs = int((band_frame["Net P&L After Charges"] > 0).sum()) if trade_legs else 0
+        loss_legs = int((band_frame["Net P&L After Charges"] < 0).sum()) if trade_legs else 0
+        if net_pnl > 0:
+            result = "Profit"
+        elif net_pnl < 0:
+            result = "Loss"
+        else:
+            result = "Break-even"
         rows.append({
             "VIX Band": band,
-            "Trade Legs": len(band_frame),
-            "Highest Profit Trade": _trade_label(best),
-            "Highest Profit Net P&L": float(best["Net P&L After Charges"]),
-            "Highest Loss Trade": _trade_label(worst),
-            "Highest Loss Net P&L": float(worst["Net P&L After Charges"]),
+            "Trade Legs": trade_legs,
+            "Winning Trades": win_legs,
+            "Losing Trades": loss_legs,
+            "Gross P&L": gross_pnl,
+            "Charges": charges,
+            "Net P&L": net_pnl,
+            "Result": result,
         })
     return pd.DataFrame(rows)
 
@@ -830,12 +836,14 @@ with tab5:
         if vix_band_selection:
             filtered = filtered[filtered["VIX Band"].astype(str).isin(vix_band_selection)]
         st.caption("This table is now filtered to the VIX bands you picked above.")
-        regime_extremes = vix_regime_extremes(filtered)
-        st.markdown("#### VIX regime extremes")
+        regime_summary = vix_regime_summary(filtered, bands=vix_band_selection or None)
+        st.markdown("#### VIX regime summary")
+        st.caption("Each row shows how many trades were taken in that VIX band and whether the total net P&L was a profit or a loss.")
         st.dataframe(
-            regime_extremes.style.format({
-                "Highest Profit Net P&L": MONEY,
-                "Highest Loss Net P&L": MONEY,
+            regime_summary.style.format({
+                "Gross P&L": MONEY,
+                "Charges": MONEY,
+                "Net P&L": MONEY,
             }),
             width="stretch",
             hide_index=True,
