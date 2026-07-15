@@ -814,25 +814,32 @@ with tab4:
     st.dataframe(display_daily.style.format({c: "₹{:,.2f}" for c in money_cols}), width="stretch", height=540, hide_index=True)
 
 with tab5:
+    st.subheader("Trade legs by VIX regime")
+    st.caption("Pick the VIX bands you want to inspect. Select `Low` and `Medium` to see the trades taken in lower-volatility sessions.")
+    vix_band_selection = st.multiselect(
+        "VIX band filter",
+        VIX_BAND_LABELS,
+        default=["Low · 12–15", "Medium · 15–18"],
+        help="Choose one or more VIX bands. Low and Medium are selected by default so you can focus on those trades first.",
+    )
     portfolios = sorted(detail["Portfolio"].unique())
     selected = st.multiselect("Portfolio blocks", portfolios, default=portfolios)
     filtered = detail[detail["Portfolio"].isin(selected)].copy()
     if market_available:
         filtered["VIX Band"] = _vix_band(filtered, vix_basis)
-        st.caption("Use the dropdown to inspect one VIX regime at a time, including the biggest win and biggest loss inside that band.")
+        if vix_band_selection:
+            filtered = filtered[filtered["VIX Band"].astype(str).isin(vix_band_selection)]
+        st.caption("This table is now filtered to the VIX bands you picked above.")
         regime_extremes = vix_regime_extremes(filtered)
-        trade_vix_band = st.selectbox("Choose VIX regime", VIX_BAND_LABELS, index=0)
-        selected_regime = regime_extremes[regime_extremes["VIX Band"] == trade_vix_band]
         st.markdown("#### VIX regime extremes")
         st.dataframe(
-            selected_regime.style.format({
+            regime_extremes.style.format({
                 "Highest Profit Net P&L": MONEY,
                 "Highest Loss Net P&L": MONEY,
             }),
             width="stretch",
             hide_index=True,
         )
-        filtered = filtered[filtered["VIX Band"].astype(str) == trade_vix_band]
     filtered["Date"] = filtered["Date"].dt.strftime("%d-%b-%Y")
     money_cols = [
         column for column in filtered.columns
