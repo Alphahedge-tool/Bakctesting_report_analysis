@@ -819,27 +819,27 @@ with tab5:
     filtered = detail[detail["Portfolio"].isin(selected)].copy()
     if market_available:
         filtered["VIX Band"] = _vix_band(filtered, vix_basis)
-        st.caption("Trade logs now include an in-tab VIX filter, plus the biggest win and biggest loss inside each VIX regime.")
+        st.caption("Use the dropdown to inspect one VIX regime at a time, including the biggest win and biggest loss inside that band.")
         regime_extremes = vix_regime_extremes(filtered)
+        trade_vix_band = st.selectbox("Choose VIX regime", VIX_BAND_LABELS, index=0)
+        selected_regime = regime_extremes[regime_extremes["VIX Band"] == trade_vix_band]
         st.markdown("#### VIX regime extremes")
         st.dataframe(
-            regime_extremes.style.format({
-                "Highest Profit Net P&L": "₹{:,.2f}",
-                "Highest Loss Net P&L": "₹{:,.2f}",
+            selected_regime.style.format({
+                "Highest Profit Net P&L": MONEY,
+                "Highest Loss Net P&L": MONEY,
             }),
             width="stretch",
             hide_index=True,
         )
-        trade_vix_band = st.selectbox("Filter trade logs by VIX band", ["All VIX bands", *VIX_BAND_LABELS], index=0)
-        if trade_vix_band != "All VIX bands":
-            filtered = filtered[filtered["VIX Band"].astype(str) == trade_vix_band]
+        filtered = filtered[filtered["VIX Band"].astype(str) == trade_vix_band]
     filtered["Date"] = filtered["Date"].dt.strftime("%d-%b-%Y")
     money_cols = [
         column for column in filtered.columns
         if any(term in column for term in ["Premium", "P&L", "Brokerage", "STT", "Transaction Charges", "SEBI Charges", "Stamp Duty", "GST"])
     ]
     st.dataframe(
-        filtered.style.format({column: "₹{:,.2f}" for column in money_cols}),
+        filtered.style.format({column: MONEY for column in money_cols}),
         width="stretch",
         height=560,
         hide_index=True,
@@ -875,3 +875,4 @@ if len(comparison_results) > 1:
         file_name="All Files Brokerage MTM VIX Analysis.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
