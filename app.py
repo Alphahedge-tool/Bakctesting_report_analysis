@@ -79,6 +79,10 @@ def _percent_in_parentheses(value, default=float("nan")):
     return float(match.group(1)) if match else default
 
 
+def _vix_band(frame: pd.DataFrame, basis: str) -> pd.Series:
+    return pd.cut(frame[basis], bins=VIX_BINS, labels=VIX_BAND_LABELS, right=False)
+
+
 def _rows_from_upload(uploaded) -> list[list]:
     raw = uploaded.getvalue()
     name = uploaded.name.lower()
@@ -314,13 +318,29 @@ with st.sidebar:
     market_available = full_daily["VIX Start"].notna().any()
     if market_available:
         vix_basis = st.selectbox("VIX basis", ["VIX Start", "VIX End", "VIX Average"], index=0)
+        full_daily["VIX Band"] = _vix_band(full_daily, vix_basis)
+        filter_mode = st.radio("VIX filter mode", ["Range", "Band"], horizontal=True)
+        st.caption("Use Range for exact min/max values or Band to quickly isolate low, medium, or high VIX sessions.")
         vix_low = float(full_daily[vix_basis].min())
         vix_high = float(full_daily[vix_basis].max())
-        vc1, vc2 = st.columns(2)
-        with vc1:
-            selected_vix_min = st.number_input("Min VIX", value=vix_low, min_value=0.0, step=0.1, format="%.2f")
-        with vc2:
-            selected_vix_max = st.number_input("Max VIX", value=vix_high, min_value=0.0, step=0.1, format="%.2f")
+        selected_vix_bands = VIX_BAND_LABELS
+        if filter_mode == "Range":
+            vc1, vc2 = st.columns(2)
+            with vc1:
+                selected_vix_min = st.number_input("Min VIX", value=vix_low, min_value=0.0, step=0.1, format="%.2f")
+            with vc2:
+                selected_vix_max = st.number_input("Max VIX", value=vix_high, min_value=0.0, step=0.1, format="%.2f")
+            vix_filter_summary = f"{selected_vix_min:.2f} to {selected_vix_max:.2f} ({vix_basis})"
+            vix_filter_mask = full_daily[vix_basis].between(selected_vix_min, selected_vix_max, inclusive="both")
+        else:
+            selected_vix_bands = st.multiselect(
+                "VIX bands",
+                VIX_BAND_LABELS,
+                default=VIX_BAND_LABELS,
+                help="Choose one or more VIX buckets to isolate low-, medium-, or high-volatility trades.",
+            )
+            vix_filter_summary = f"{', '.join(selected_vix_bands) if selected_vix_bands else 'No bands selected'} ({vix_basis})"
+            vix_filter_mask = full_daily["VIX Band"].isin(selected_vix_bands)
 
         underlying_low = float(full_daily["Underlying Change"].min())
         underlying_high = float(full_daily["Underlying Change"].max())
@@ -356,7 +376,7 @@ with st.sidebar:
             lambda value: "Small movement" if value <= large_move_threshold else "Large movement"
         )
         filter_mask = (
-            full_daily[vix_basis].between(selected_vix_min, selected_vix_max, inclusive="both")
+            vix_filter_mask
             & full_daily["Underlying Change"].between(selected_underlying_min, selected_underlying_max, inclusive="both")
         )
         filtered_dates = full_daily.loc[filter_mask, "Date"]
@@ -367,6 +387,9 @@ with st.sidebar:
 
 daily = full_daily[full_daily["Date"].isin(filtered_dates)].copy()
 detail = full_detail[full_detail["Date"].isin(filtered_dates)].copy()
+if market_available:
+    daily["VIX Band"] = _vix_band(daily, vix_basis)
+    detail["VIX Band"] = _vix_band(detail, vix_basis)
 daily["Cumulative Premium Turnover"] = daily["Premium Turnover"].cumsum()
 daily["Cumulative Net P&L"] = daily["Net P&L After Charges"].cumsum()
 if daily.empty:
@@ -659,13 +682,13 @@ with tab2:
         st.plotly_chart(scatter, width="stretch")
     with vright:
         band_labels = VIX_BAND_LABELS
-        bands = pd.cut(full_daily["VIX Start"], bins=VIX_BINS, labels=band_labels, right=False)
+        bands = _vix_band(full_daily, vix_basis)
         band_view = full_daily.assign(**{"VIX Band": bands}).groupby("VIX Band", observed=True).agg(
             Days=("Date", "count"), Gross_PnL=("Gross P&L", "sum"), Charges=("Total Brokerage (Including All Charges)", "sum"), Net_PnL=("Net P&L After Charges", "sum")
         ).reset_index()
         st.subheader("All-days VIX bands")
         st.dataframe(band_view.style.format({"Gross_PnL":"₹{:,.2f}", "Charges":"₹{:,.2f}", "Net_PnL":"₹{:,.2f}"}), width="stretch", hide_index=True)
-        st.caption("This band table uses all uploaded days; sidebar filters control the other results.")
+        st.caption(f"This band table uses the selected VIX basis ({vix_basis}); sidebar filters control the other results.")
 
     st.subheader("Dates by VIX band")
     selected_band = st.selectbox("Choose a VIX band", ["All VIX bands", *band_labels], index=0)
@@ -763,6 +786,8 @@ with tab5:
     portfolios = sorted(detail["Portfolio"].unique())
     selected = st.multiselect("Portfolio blocks", portfolios, default=portfolios)
     filtered = detail[detail["Portfolio"].isin(selected)].copy()
+    if market_available:
+        st.caption("Trade logs include VIX Band, VIX Start, and VIX End so you can audit low- and high-VIX trades directly.")
     filtered["Date"] = filtered["Date"].dt.strftime("%d-%b-%Y")
     st.dataframe(filtered, width="stretch", height=560, hide_index=True)
 
@@ -780,7 +805,7 @@ rates = {
     "Brokerage per executed order": brokerage_rate, "STT % on sell premium": stt_rate,
     "NSE transaction charge %": exchange_rate, "SEBI charge %": sebi_rate,
     "Stamp duty % on buy premium": stamp_rate, "GST %": gst_rate,
-    "Applied VIX filter": f"{selected_vix_min:.2f} to {selected_vix_max:.2f} ({vix_basis})" if market_available else "Not available",
+    "Applied VIX filter": vix_filter_summary if market_available else "Not available",
     "Applied underlying-change filter": f"{selected_underlying_min:.2f} to {selected_underlying_max:.2f}" if market_available else "Not available",
     "Range-bound threshold": f"{regime_range_threshold:.2f} points" if market_available else "Not available",
     "Large-movement threshold": f"{large_move_threshold:.2f} points" if market_available else "Not available",
