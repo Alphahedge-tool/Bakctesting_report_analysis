@@ -437,6 +437,83 @@ def rolling_metrics(frame: pd.DataFrame, window: int, column: str = "Net P&L Aft
     })
 
 
+MONTH_LABELS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
+WEEKDAY_LABELS = ["MON", "TUE", "WED", "THU", "FRI"]
+# Soft red→amber→green: light enough in the middle that in-cell text stays legible.
+HEAT_SCALE = [
+    [0.0, "#d73027"], [0.25, "#fc8d59"], [0.45, "#fee08b"],
+    [0.5, "#ffffbf"], [0.55, "#d9ef8b"], [0.75, "#91cf60"], [1.0, "#1a9850"],
+]
+
+
+def compact_money(value: float) -> str:
+    """Indian short form so heatmap cells stay readable: 45.2k, 3.10L, 1.25Cr."""
+    if pd.isna(value):
+        return ""
+    magnitude = abs(value)
+    if magnitude >= 1e7:
+        return f"{value / 1e7:.2f}Cr"
+    if magnitude >= 1e5:
+        return f"{value / 1e5:.2f}L"
+    if magnitude >= 1e3:
+        return f"{value / 1e3:.1f}k"
+    return f"{value:,.0f}"
+
+
+def seasonality_table(frame: pd.DataFrame, basis: str, column: str = "Net P&L After Charges") -> pd.DataFrame:
+    """Year × month (or year × weekday) net P&L, with every period column present
+    so the grid never changes shape between uploads."""
+    dates = pd.to_datetime(frame["Date"])
+    if basis == "month":
+        keys, labels, order = dates.dt.month, MONTH_LABELS, range(1, 13)
+    else:
+        keys, labels, order = dates.dt.dayofweek, WEEKDAY_LABELS, range(0, 5)
+    pivot = frame.assign(_Year=dates.dt.year, _Key=keys).pivot_table(
+        index="_Year", columns="_Key", values=column, aggfunc="sum",
+    ).reindex(columns=list(order))
+    pivot.columns = labels
+    pivot.index.name = "Year"
+    return pivot.sort_index()
+
+
+def heatmap_figure(table: pd.DataFrame, title: str, height: int = 320) -> go.Figure:
+    """Annotated diverging heatmap in the OpenStatz seasonality style."""
+    limit = float(table.abs().max().max() or 1)
+    text = [[compact_money(value) for value in row] for row in table.values]
+    figure = go.Figure(go.Heatmap(
+        z=table.values, x=list(table.columns), y=table.index.astype(str),
+        text=text, texttemplate="%{text}", textfont=dict(size=11, color="#1f2937"),
+        colorscale=HEAT_SCALE, zmid=0, zmin=-limit, zmax=limit,
+        xgap=3, ygap=3,
+        colorbar=dict(thickness=12, tickformat=",.0f", outlinewidth=0),
+        hovertemplate="%{y} %{x}<br>₹%{z:,.0f}<extra></extra>",
+    ))
+    figure.update_layout(
+        title=title, template="plotly_white", height=height,
+        margin=dict(l=10, r=10, t=52, b=20),
+        yaxis=dict(title="Year", autorange="reversed", type="category"),
+        xaxis=dict(side="bottom", type="category"),
+    )
+    return figure
+
+
+def histogram_bars(series: pd.Series, bins: int = 40) -> tuple[list, list, list, list]:
+    """Bin a series into (centres, counts, widths, colours) with bars coloured
+    by the sign of the bin, the way the OpenStatz distribution chart does."""
+    clean = pd.to_numeric(series, errors="coerce").dropna()
+    if clean.empty:
+        return [], [], [], []
+    if clean.nunique() == 1:
+        only = float(clean.iloc[0])
+        return [only], [len(clean)], [max(abs(only) * 0.1, 1.0)], [
+            "#16a34a" if only >= 0 else "#dc2626"]
+    grouped = pd.cut(clean, bins=bins).value_counts().sort_index()
+    centres = [interval.mid for interval in grouped.index]
+    widths = [interval.length for interval in grouped.index]
+    colours = ["#16a34a" if centre >= 0 else "#dc2626" for centre in centres]
+    return centres, list(grouped.values), widths, colours
+
+
 def drawdown_episodes(frame: pd.DataFrame, column: str = "Net P&L After Charges") -> pd.DataFrame:
     """Every peak-to-recovery drawdown, deepest first (OpenStatz risk section)."""
     pnl = pd.to_numeric(frame[column], errors="coerce").fillna(0)
@@ -943,8 +1020,9 @@ if len(comparison_results) == 2:
             )
 
 st.caption(f"Filtered result · {len(daily)} of {len(full_daily)} days · {detail.shape[0]} trade legs")
-overview_tab, rolling_tab, vix_tab, regime_tab, daily_tab, book_tab, audit_tab = st.tabs(
-    ["Overview", "Rolling stats", "VIX analysis", "Market regimes", "Daily breakdown", "Order book", "Charges audit"]
+overview_tab, rolling_tab, season_tab, vix_tab, regime_tab, daily_tab, book_tab, audit_tab = st.tabs(
+    ["Overview", "Rolling stats", "Seasonality", "VIX analysis", "Market regimes",
+     "Daily breakdown", "Order book", "Charges audit"]
 )
 with overview_tab:
     stats = performance_stats(daily)
@@ -985,33 +1063,15 @@ with overview_tab:
         pie.update_layout(title="Charge composition", template="plotly_white", height=380, margin=dict(l=10,r=10,t=52,b=15), showlegend=True)
         st.plotly_chart(pie, width="stretch")
 
-    dd_col, heat_col = st.columns([1.6, 1])
-    with dd_col:
-        underwater = drawdown_series(net_by_day)
-        dd_fig = go.Figure(go.Scatter(
-            x=daily["Date"], y=underwater, fill="tozeroy", mode="lines",
-            line=dict(color="#dc2626", width=1.2), fillcolor="rgba(220,38,38,.18)",
-            hovertemplate="%{x|%d-%b-%Y}<br>Drawdown ₹%{y:,.0f}<extra></extra>",
-        ))
-        dd_fig.update_layout(title="Underwater curve · drawdown from peak", template="plotly_white",
-                             height=300, margin=dict(l=20, r=20, t=48, b=20), showlegend=False)
-        st.plotly_chart(dd_fig, width="stretch")
-    with heat_col:
-        monthly = daily.assign(
-            Year=daily["Date"].dt.year, Month=daily["Date"].dt.strftime("%b"),
-        ).pivot_table(index="Year", columns="Month", values="Net P&L After Charges", aggfunc="sum")
-        month_order = [m for m in ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"] if m in monthly.columns]
-        monthly = monthly[month_order]
-        limit = float(monthly.abs().max().max() or 1)
-        heat = go.Figure(go.Heatmap(
-            z=monthly.values, x=monthly.columns, y=monthly.index.astype(str),
-            colorscale=[[0, "#dc2626"], [0.5, "#f8fafc"], [1, "#16a34a"]],
-            zmid=0, zmin=-limit, zmax=limit, showscale=False,
-            hovertemplate="%{y} %{x}<br>₹%{z:,.0f}<extra></extra>",
-        ))
-        heat.update_layout(title="Monthly net P&L", template="plotly_white",
-                           height=300, margin=dict(l=10, r=10, t=48, b=20))
-        st.plotly_chart(heat, width="stretch")
+    underwater = drawdown_series(net_by_day)
+    dd_fig = go.Figure(go.Scatter(
+        x=daily["Date"], y=underwater, fill="tozeroy", mode="lines",
+        line=dict(color="#dc2626", width=1.2), fillcolor="rgba(220,38,38,.18)",
+        hovertemplate="%{x|%d-%b-%Y}<br>Drawdown ₹%{y:,.0f}<extra></extra>",
+    ))
+    dd_fig.update_layout(title="Underwater curve · drawdown from peak", template="plotly_white",
+                         height=280, margin=dict(l=20, r=20, t=48, b=20), showlegend=False)
+    st.plotly_chart(dd_fig, width="stretch")
 
     with st.expander("Full risk and return statistics"):
         st.caption(
@@ -1110,31 +1170,89 @@ with rolling_tab:
                    "'Still open' means equity had not reclaimed the prior peak by the last session.")
         st.dataframe(shown.style.format({"Depth": MONEY, "Sessions": "{:,.0f}"}), width="stretch", hide_index=True)
 
-    st.markdown("#### Session P&L distribution")
-    dist_left, dist_right = st.columns([1.6, 1])
+
+with season_tab:
+    st.subheader("Seasonality")
+    st.caption("Net P&L after all charges, aggregated by calendar period. Green is profit, red is loss; "
+               "cells show the period total in short form (k = thousand, L = lakh, Cr = crore).")
+    monthly_table = seasonality_table(daily, "month")
+    st.plotly_chart(
+        heatmap_figure(monthly_table, "Monthly net P&L (₹)", height=90 + 46 * max(len(monthly_table), 1)),
+        width="stretch",
+    )
+
+    season_left, season_right = st.columns([1, 1])
+    with season_left:
+        weekday_table = seasonality_table(daily, "weekday")
+        st.plotly_chart(
+            heatmap_figure(weekday_table, "Net P&L by expiry weekday (₹)",
+                           height=90 + 46 * max(len(weekday_table), 1)),
+            width="stretch",
+        )
+        st.caption("Expiry weekday shifts over the sample, so this separates sessions that landed on different days.")
+    with season_right:
+        yearly = monthly_table.sum(axis=1)
+        year_fig = go.Figure(go.Bar(
+            x=yearly.index.astype(str), y=yearly.values,
+            marker_color=["#16a34a" if value >= 0 else "#dc2626" for value in yearly.values],
+            text=[compact_money(value) for value in yearly.values], textposition="outside",
+            hovertemplate="%{x}<br>₹%{y:,.0f}<extra></extra>",
+        ))
+        year_fig.add_hline(y=0, line_width=1, line_color="#94a3b8")
+        year_fig.update_layout(title="End-of-year net P&L (₹)", template="plotly_white",
+                               height=90 + 46 * max(len(monthly_table), 1),
+                               margin=dict(l=10, r=10, t=52, b=20), showlegend=False)
+        st.plotly_chart(year_fig, width="stretch")
+
+    with st.expander("Monthly net P&L as a table"):
+        st.dataframe(
+            monthly_table.style.format(lambda v: "—" if pd.isna(v) else MONEY.format(v))
+            .map(_pnl_text),
+            width="stretch",
+        )
+
+    st.markdown("### Distribution")
+    st.caption("Shape and tails of the session P&L series.")
+    shape = performance_stats(daily)
+    st.markdown(stat_cards([
+        ("Best session", _num(shape.get("Best day", float("nan")), "₹{:,.0f}"), "pos"),
+        ("Worst session", _num(shape.get("Worst day", float("nan")), "₹{:,.0f}"), "neg"),
+        ("Skew", _num(shape.get("Skew", float("nan")), "{:.2f}"), _tone(shape.get("Skew", float("nan")))),
+        ("Kurtosis", _num(shape.get("Kurtosis", float("nan")), "{:.2f}"), "neutral"),
+        ("Outlier win", _num(shape.get("Outlier win ratio", float("nan")), "{:.2f}"), "neutral"),
+        ("Outlier loss", _num(shape.get("Outlier loss ratio", float("nan")), "{:.2f}"), "neutral"),
+        ("Tail ratio", _num(shape.get("Tail ratio", float("nan")), "{:.2f}"), "neutral"),
+        ("Gain to pain", _num(shape.get("Gain to pain", float("nan")), "{:.2f}"), "neutral"),
+    ]), unsafe_allow_html=True)
+
+    dist_left, dist_right = st.columns([1.25, 1])
     with dist_left:
         net_series = daily["Net P&L After Charges"]
-        hist = go.Figure(go.Histogram(
-            x=net_series, nbinsx=40, marker_color="#2563eb",
+        centres, counts, widths, colours = histogram_bars(net_series)
+        hist = go.Figure(go.Bar(
+            x=centres, y=counts, width=widths, marker_color=colours, marker_line_width=0,
             hovertemplate="₹%{x:,.0f}<br>%{y} sessions<extra></extra>",
         ))
-        hist.add_vline(x=float(net_series.mean()), line_width=2, line_dash="dash", line_color="#16a34a",
+        hist.add_vline(x=float(net_series.mean()), line_width=2, line_dash="dot", line_color="#0f172a",
                        annotation_text="mean", annotation_position="top")
-        hist.add_vline(x=0, line_width=1, line_color="#94a3b8")
-        hist.update_layout(title="Distribution of session net P&L", template="plotly_white",
-                           height=310, margin=dict(l=20, r=20, t=48, b=20), showlegend=False)
+        hist.update_layout(title="Session P&L · histogram with mean marker", template="plotly_white",
+                           height=320, margin=dict(l=20, r=20, t=52, b=20), showlegend=False,
+                           bargap=0.02, xaxis_title="Net P&L (₹)", yaxis_title="Sessions")
         st.plotly_chart(hist, width="stretch")
     with dist_right:
-        shape = performance_stats(daily)
-        st.markdown(stat_cards([
-            ("Skew", _num(shape.get("Skew", float("nan")), "{:.2f}"), _tone(shape.get("Skew", float("nan")))),
-            ("Kurtosis", _num(shape.get("Kurtosis", float("nan")), "{:.2f}"), "neutral"),
-            ("Tail ratio", _num(shape.get("Tail ratio", float("nan")), "{:.2f}"), "neutral"),
-            ("Common sense ratio", _num(shape.get("Common sense ratio", float("nan")), "{:.2f}"), "neutral"),
-            ("CPC index", _num(shape.get("CPC index", float("nan")), "{:.2f}"), "neutral"),
-            ("Gain to pain", _num(shape.get("Gain to pain", float("nan")), "{:.2f}"), "neutral"),
-        ]), unsafe_allow_html=True)
-        st.caption("Negative skew and high kurtosis are the signature of short-option P&L: many small wins, occasional large losses.")
+        monthly_series = daily.set_index("Date")["Net P&L After Charges"].resample("ME").sum()
+        spread = go.Figure()
+        spread.add_trace(go.Box(x=net_series, name="Session", marker_color="#2563eb",
+                                boxmean=True, orientation="h"))
+        spread.add_trace(go.Box(x=monthly_series, name="Monthly", marker_color="#0d9488",
+                                boxmean=True, orientation="h"))
+        spread.add_vline(x=0, line_width=1, line_color="#94a3b8")
+        spread.update_layout(title="P&L spread · session vs monthly", template="plotly_white",
+                             height=320, margin=dict(l=20, r=20, t=52, b=20), showlegend=False,
+                             xaxis_title="Net P&L (₹)")
+        st.plotly_chart(spread, width="stretch")
+    st.caption("Negative skew with fat tails is the signature of short-option P&L: many small wins, "
+               "occasional large losses. Outlier ratios above ~2 mean the extremes are several times the average.")
 
 
 with vix_tab:
