@@ -388,7 +388,86 @@ def performance_stats(frame: pd.DataFrame, column: str = "Net P&L After Charges"
         "Max win streak": _max_consecutive(pnl > 0),
         "Max loss streak": _max_consecutive(pnl < 0),
     })
+
+    # Shape, tail and consistency measures, same definitions as OpenStatz.
+    upper, lower = pnl.quantile(0.95), pnl.quantile(0.05)
+    tail_ratio = abs(upper / lower) if lower else float("nan")
+    profit_factor = stats["Profit factor"]
+    positive_mean = pnl[pnl >= 0].mean()
+    negative_mean = pnl[pnl < 0].mean()
+    ulcer = ((drawdown ** 2).sum() / (len(pnl) - 1)) ** 0.5 if len(pnl) > 1 else float("nan")
+    stats.update({
+        "Skew": float(pnl.skew()),
+        "Kurtosis": float(pnl.kurtosis()),
+        "Tail ratio": float(tail_ratio),
+        "Common sense ratio": float(profit_factor * tail_ratio) if pd.notna(profit_factor) else float("nan"),
+        "CPC index": float(profit_factor * win_rate * payoff) if pd.notna(profit_factor) and pd.notna(payoff) else float("nan"),
+        "Outlier win ratio": float(pnl.quantile(0.99) / positive_mean) if pd.notna(positive_mean) and positive_mean else float("nan"),
+        "Outlier loss ratio": float(pnl.quantile(0.01) / negative_mean) if pd.notna(negative_mean) and negative_mean else float("nan"),
+        "Gain to pain": float(pnl.sum() / abs(losses.sum())) if len(losses) and losses.sum() else float("nan"),
+        "Risk return ratio": float(pnl.mean() / std) if std else float("nan"),
+        "Risk of ruin": float(((1 - win_rate) / (1 + win_rate)) ** len(pnl)) if pd.notna(win_rate) else float("nan"),
+        "Exposure": len(traded) / len(pnl) if len(pnl) else float("nan"),
+        "Ulcer index": float(ulcer),
+        "Ulcer performance index": float(pnl.sum() / ulcer) if ulcer else float("nan"),
+    })
     return stats
+
+
+def rolling_metrics(frame: pd.DataFrame, window: int, column: str = "Net P&L After Charges") -> pd.DataFrame:
+    """Rolling Sharpe, Sortino, volatility and win rate.
+
+    Mirrors OpenStatz's rolling_* functions: Sharpe and Sortino annualise a
+    rolling mean over a rolling dispersion, volatility annualises the rolling
+    standard deviation, and win rate divides rolling wins by rolling non-zero
+    sessions so flat sessions never inflate the denominator.
+    """
+    pnl = pd.to_numeric(frame[column], errors="coerce")
+    root = _periods_per_year(frame["Date"]) ** 0.5
+    rolling = pnl.rolling(window)
+    downside = (rolling.apply(lambda x: (x[x < 0] ** 2).sum(), raw=True) / window) ** 0.5
+    won = (pnl > 0).astype(float).rolling(window).sum()
+    traded = (pnl != 0).astype(float).rolling(window).sum()
+    return pd.DataFrame({
+        "Date": frame["Date"].values,
+        "Rolling Sharpe": (rolling.mean() / rolling.std() * root).values,
+        "Rolling Sortino": (rolling.mean() / downside * root).values,
+        "Rolling volatility": (rolling.std() * root).values,
+        "Rolling win rate": (won / traded.where(traded > 0) * 100).values,
+    })
+
+
+def drawdown_episodes(frame: pd.DataFrame, column: str = "Net P&L After Charges") -> pd.DataFrame:
+    """Every peak-to-recovery drawdown, deepest first (OpenStatz risk section)."""
+    pnl = pd.to_numeric(frame[column], errors="coerce").fillna(0)
+    dates = pd.to_datetime(frame["Date"]).reset_index(drop=True)
+    drawdown = drawdown_series(pnl).reset_index(drop=True)
+    underwater = drawdown < -1e-9
+
+    episodes, start = [], None
+    for position, below in enumerate(underwater):
+        if below and start is None:
+            start = position
+        elif not below and start is not None:
+            episodes.append((start, position - 1))
+            start = None
+    if start is not None:
+        episodes.append((start, len(underwater) - 1))
+
+    rows = []
+    for first, last in episodes:
+        window = drawdown.iloc[first:last + 1]
+        trough = int(window.idxmin())
+        rows.append({
+            "Started": dates.iloc[max(first - 1, 0)],
+            "Trough": dates.iloc[trough],
+            "Recovered": dates.iloc[last + 1] if last + 1 < len(dates) else pd.NaT,
+            "Depth": float(window.min()),
+            "Sessions": last - first + 2,
+            "To recover": last - trough + 1 if last + 1 < len(dates) else None,
+        })
+    table = pd.DataFrame(rows)
+    return table.sort_values("Depth").reset_index(drop=True) if len(table) else table
 
 
 def stat_cards(items: list[tuple[str, str, str]]) -> str:
@@ -864,8 +943,10 @@ if len(comparison_results) == 2:
             )
 
 st.caption(f"Filtered result · {len(daily)} of {len(full_daily)} days · {detail.shape[0]} trade legs")
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["Overview", "VIX analysis", "Market regimes", "Daily breakdown", "Trade legs", "Charges audit"])
-with tab1:
+overview_tab, rolling_tab, vix_tab, regime_tab, daily_tab, book_tab, audit_tab = st.tabs(
+    ["Overview", "Rolling stats", "VIX analysis", "Market regimes", "Daily breakdown", "Order book", "Charges audit"]
+)
+with overview_tab:
     stats = performance_stats(daily)
     st.markdown(stat_cards([
         ("Net P&L", _num(stats.get("Net P&L", float("nan")), "₹{:,.0f}"), _tone(stats.get("Net P&L", float("nan")))),
@@ -946,6 +1027,12 @@ with tab1:
             "Average loss": "₹{:,.2f}", "Best day": "₹{:,.2f}", "Worst day": "₹{:,.2f}",
             "VaR 95%": "₹{:,.2f}", "CVaR 95%": "₹{:,.2f}",
             "Max win streak": "{:,.0f}", "Max loss streak": "{:,.0f}",
+            "Skew": "{:.3f}", "Kurtosis": "{:.3f}", "Tail ratio": "{:.2f}",
+            "Common sense ratio": "{:.2f}", "CPC index": "{:.2f}",
+            "Outlier win ratio": "{:.2f}", "Outlier loss ratio": "{:.2f}",
+            "Gain to pain": "{:.2f}", "Risk return ratio": "{:.3f}",
+            "Risk of ruin": "{:.2%}", "Exposure": "{:.1%}",
+            "Ulcer index": "₹{:,.2f}", "Ulcer performance index": "{:.2f}",
         }
         stats_table = pd.DataFrame(
             [(name, "—" if pd.isna(stats.get(name, float("nan"))) else spec.format(stats[name]))
@@ -957,7 +1044,100 @@ with tab1:
         st.dataframe(stats_table, width="stretch", hide_index=True, height=420)
         st.caption("VaR / CVaR are historical (empirical 5th percentile of session P&L), not normal-parametric — option-selling P&L has a fat left tail that a normal fit understates.")
 
-with tab2:
+with rolling_tab:
+    st.subheader("Rolling statistics")
+    sessions_per_year = _periods_per_year(daily["Date"])
+    default_window = max(6, min(int(round(sessions_per_year / 2)) or 6, max(len(daily) - 1, 6)))
+    wc1, wc2 = st.columns([1, 3])
+    with wc1:
+        window = st.number_input(
+            "Rolling window (sessions)", min_value=3, max_value=max(len(daily), 4),
+            value=min(default_window, max(len(daily), 4)), step=1,
+            help=f"Defaults to about half a year at this export's cadence of {sessions_per_year:.0f} sessions a year.",
+        )
+    with wc2:
+        st.caption(
+            f"Each point summarises the previous {window} sessions. Ratios are annualised on "
+            f"{sessions_per_year:.0f} sessions per year, measured from the export's own dates. "
+            "Definitions follow OpenStatz's rolling_sharpe, rolling_sortino, rolling_volatility and rolling_win_rate."
+        )
+
+    if len(daily) <= window:
+        st.warning(f"Need more than {window} sessions to plot a {window}-session rolling window. "
+                   f"This selection has {len(daily)}. Lower the window or widen the filters.")
+    else:
+        rolling = rolling_metrics(daily, int(window))
+        specs = [
+            ("Rolling Sharpe", "#2563eb", "Rolling Sharpe ratio", "{:.2f}", 0),
+            ("Rolling Sortino", "#7c3aed", "Rolling Sortino ratio", "{:.2f}", 0),
+            ("Rolling volatility", "#f59e0b", "Rolling volatility (₹, annualised)", "₹{:,.0f}", None),
+            ("Rolling win rate", "#0d9488", "Rolling win rate (%)", "{:.1f}%", 50),
+        ]
+        for index in range(0, len(specs), 2):
+            for container, (column, colour, title, _fmt, rule) in zip(st.columns(2), specs[index:index + 2]):
+                with container:
+                    chart = go.Figure(go.Scatter(
+                        x=rolling["Date"], y=rolling[column], mode="lines",
+                        line=dict(color=colour, width=2), name=column,
+                        hovertemplate="%{x|%d-%b-%Y}<br>%{y:,.2f}<extra></extra>",
+                    ))
+                    if rule is not None:
+                        chart.add_hline(y=rule, line_width=1, line_dash="dash", line_color="#94a3b8")
+                    chart.update_layout(title=title, template="plotly_white", height=290,
+                                        margin=dict(l=20, r=20, t=48, b=20), showlegend=False)
+                    st.plotly_chart(chart, width="stretch")
+
+        latest = rolling.dropna().tail(1)
+        if not latest.empty:
+            row = latest.iloc[0]
+            st.markdown(stat_cards([
+                (f"Sharpe · last {window}", _num(row['Rolling Sharpe'], "{:.2f}"), _tone(row["Rolling Sharpe"])),
+                (f"Sortino · last {window}", _num(row['Rolling Sortino'], "{:.2f}"), _tone(row["Rolling Sortino"])),
+                (f"Volatility · last {window}", _num(row['Rolling volatility'], "₹{:,.0f}"), "neutral"),
+                (f"Win rate · last {window}", _num(row['Rolling win rate'], "{:.1f}", "%"), "neutral"),
+            ]), unsafe_allow_html=True)
+
+    st.markdown("#### Drawdown episodes")
+    episodes = drawdown_episodes(daily)
+    if episodes.empty:
+        st.success("No drawdown: the equity curve never traded below a previous peak.")
+    else:
+        shown = episodes.head(10).copy()
+        for column in ["Started", "Trough", "Recovered"]:
+            shown[column] = pd.to_datetime(shown[column]).dt.strftime("%d-%b-%Y").fillna("Still open")
+        shown["To recover"] = shown["To recover"].apply(lambda v: "Still open" if pd.isna(v) else f"{int(v)} sessions")
+        st.caption(f"{len(episodes)} drawdown episodes, ten deepest first. "
+                   "'Still open' means equity had not reclaimed the prior peak by the last session.")
+        st.dataframe(shown.style.format({"Depth": MONEY, "Sessions": "{:,.0f}"}), width="stretch", hide_index=True)
+
+    st.markdown("#### Session P&L distribution")
+    dist_left, dist_right = st.columns([1.6, 1])
+    with dist_left:
+        net_series = daily["Net P&L After Charges"]
+        hist = go.Figure(go.Histogram(
+            x=net_series, nbinsx=40, marker_color="#2563eb",
+            hovertemplate="₹%{x:,.0f}<br>%{y} sessions<extra></extra>",
+        ))
+        hist.add_vline(x=float(net_series.mean()), line_width=2, line_dash="dash", line_color="#16a34a",
+                       annotation_text="mean", annotation_position="top")
+        hist.add_vline(x=0, line_width=1, line_color="#94a3b8")
+        hist.update_layout(title="Distribution of session net P&L", template="plotly_white",
+                           height=310, margin=dict(l=20, r=20, t=48, b=20), showlegend=False)
+        st.plotly_chart(hist, width="stretch")
+    with dist_right:
+        shape = performance_stats(daily)
+        st.markdown(stat_cards([
+            ("Skew", _num(shape.get("Skew", float("nan")), "{:.2f}"), _tone(shape.get("Skew", float("nan")))),
+            ("Kurtosis", _num(shape.get("Kurtosis", float("nan")), "{:.2f}"), "neutral"),
+            ("Tail ratio", _num(shape.get("Tail ratio", float("nan")), "{:.2f}"), "neutral"),
+            ("Common sense ratio", _num(shape.get("Common sense ratio", float("nan")), "{:.2f}"), "neutral"),
+            ("CPC index", _num(shape.get("CPC index", float("nan")), "{:.2f}"), "neutral"),
+            ("Gain to pain", _num(shape.get("Gain to pain", float("nan")), "{:.2f}"), "neutral"),
+        ]), unsafe_allow_html=True)
+        st.caption("Negative skew and high kurtosis are the signature of short-option P&L: many small wins, occasional large losses.")
+
+
+with vix_tab:
     vleft, vright = st.columns([1.45, 1])
     with vleft:
         scatter = go.Figure(go.Scatter(
@@ -1001,7 +1181,7 @@ with tab2:
         width="stretch", height=430, hide_index=True,
     )
 
-with tab3:
+with regime_tab:
     if not market_available:
         st.warning("Upload the original MT Quant CSV to analyse market regimes.")
     else:
@@ -1066,13 +1246,13 @@ with tab3:
                 width="stretch", height=420, hide_index=True,
             )
 
-with tab4:
+with daily_tab:
     display_daily = daily.copy()
     display_daily["Date"] = display_daily["Date"].dt.strftime("%d-%b-%Y")
     money_cols = [c for c in display_daily.columns if any(term in c for term in ["Premium", "P&L", "Brokerage", "STT", "Transaction Charges", "SEBI Charges", "Stamp Duty", "GST"])]
     st.dataframe(display_daily.style.format({c: "₹{:,.2f}" for c in money_cols}), width="stretch", height=540, hide_index=True)
 
-with tab5:
+with book_tab:
     st.subheader("Order book")
     fc1, fc2, fc3, fc4 = st.columns([1.5, 1.5, 1, 1])
     with fc1:
@@ -1153,7 +1333,7 @@ with tab5:
         st.dataframe(styled, width="stretch", height=560, hide_index=True)
         st.caption(f"{len(book):,} legs · {len(columns)} columns · BUY blue, SELL amber, CE green, PE red.")
 
-with tab6:
+with audit_tab:
     audit = pd.DataFrame({
         "Charge": ["Zerodha brokerage", "STT", "NSE transaction charges", "SEBI charges", "Stamp duty", "GST", "FINAL TOTAL"],
         "Calculation basis": ["Executed orders × rate", "Sell premium value", "Buy + sell premium turnover", "Buy + sell premium turnover", "Buy premium value", "Brokerage + NSE + SEBI", "Sum of every charge"],
