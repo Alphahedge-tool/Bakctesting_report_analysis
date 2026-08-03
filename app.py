@@ -67,11 +67,20 @@ MARKET_COLUMNS = ["VIX Start", "VIX End", "VIX Average", "Underlying Change", "G
 BASE_COLUMNS = CORE_COLUMNS + MARKET_COLUMNS
 VIX_BINS = [0, 12, 15, 18, 22, float("inf")]
 VIX_BAND_LABELS = ["Very Low · Below 12", "Low · 12–15", "Medium · 15–18", "High · 18–22", "Very High · Above 22"]
+# A trade row always carries a leg label in column 3, whatever the portfolio is called.
+LEG_LABEL = re.compile(r"^leg[\s._-]*\d+$", re.IGNORECASE)
+# Column 2 values that label a header row rather than name a portfolio block.
+PORTFOLIO_HEADER_LABELS = {"portfolio name", "portfolios"}
 
 
 def _first_number(value, default=float("nan")):
     match = re.search(r"[-+]?\d+(?:\.\d+)?", str(value).replace(",", ""))
     return float(match.group()) if match else default
+
+
+def _is_leg_label(value) -> bool:
+    """True for the leg column of a trade row: Leg1, Leg 2, Leg_3, ..."""
+    return bool(LEG_LABEL.match(str(value).strip()))
 
 
 def _percent_in_parentheses(value, default=float("nan")):
@@ -123,40 +132,36 @@ def parse_trades(uploaded) -> pd.DataFrame:
         return frame[BASE_COLUMNS].copy()
 
     current_date = None
-    primary_portfolio = None
+    declared_portfolios = []
     current_market = {column: float("nan") for column in MARKET_COLUMNS}
+    day_context_captured = False
     trades = []
     for row in rows:
         row = list(row) + [""] * max(0, 15 - len(row))
-        if str(row[0]).strip() == "Portfolios" and str(row[1]).strip():
-            primary_portfolio = str(row[1]).strip()
+        label = str(row[0]).strip()
+        if label == "Portfolios":
+            # One export can declare a single block (OTM2) or an hourly ladder
+            # (09:30, 10:30, ... 15:00). Every declared block is analysed.
+            declared_portfolios = [str(cell).strip() for cell in row[1:] if str(cell).strip()]
             continue
-        if str(row[0]).strip() == "Date" and row[1]:
+        if label == "Date" and row[1]:
             value = row[1]
             if isinstance(value, datetime):
                 current_date = value.date()
             else:
                 current_date = pd.to_datetime(value, dayfirst=True).date()
             current_market = {column: float("nan") for column in MARKET_COLUMNS}
+            day_context_captured = False
+            continue
+        if not current_date:
             continue
         portfolio = str(row[1]).strip()
-        leg = str(row[2]).strip()
-        # The first OTM2 summary row contains the day's primary market context.
-        # Re-entry summary rows have their own intraday VIX windows, but all legs
-        # are deliberately classified using the original day's VIX start/end.
-        if current_date and portfolio == primary_portfolio and not leg.lower().startswith("leg") and row[9] != "":
-            vix_start = _first_number(row[9])
-            vix_end = _first_number(row[10])
-            current_market = {
-                "VIX Start": vix_start,
-                "VIX End": vix_end,
-                "VIX Average": (vix_start + vix_end) / 2,
-                "Underlying Change": _first_number(row[8]),
-                "Gap Change": _first_number(row[7]),
-                "Gap Change %": _percent_in_parentheses(row[7]),
-            }
+        if not portfolio or portfolio.lower() in PORTFOLIO_HEADER_LABELS:
             continue
-        if current_date and primary_portfolio and portfolio.startswith(primary_portfolio) and leg.lower().startswith("leg"):
+        leg = str(row[2]).strip()
+        if _is_leg_label(leg):
+            # A leg belongs to whichever portfolio block names it, so hourly
+            # blocks and re-entry blocks (OTM2_RE1) are both picked up.
             strike = str(row[4]).strip()
             trades.append({
                 "Date": current_date, "Portfolio": portfolio, "Leg": leg,
@@ -168,8 +173,27 @@ def parse_trades(uploaded) -> pd.DataFrame:
                 "Start Time": str(row[13]).strip(), "End Time": str(row[14]).strip(),
                 **current_market,
             })
+            continue
+        # Portfolio summary row. Later blocks carry their own intraday VIX window,
+        # but every leg of the day is deliberately classified on the day's first
+        # window so daily VIX bands stay comparable across files.
+        vix_start = _first_number(row[9])
+        vix_end = _first_number(row[10])
+        if not day_context_captured and pd.notna(vix_start) and pd.notna(vix_end):
+            current_market = {
+                "VIX Start": vix_start,
+                "VIX End": vix_end,
+                "VIX Average": (vix_start + vix_end) / 2,
+                "Underlying Change": _first_number(row[8]),
+                "Gap Change": _first_number(row[7]),
+                "Gap Change %": _percent_in_parentheses(row[7]),
+            }
+            day_context_captured = True
     if not trades:
-        raise ValueError("No MT Quant trade legs were found. Upload the complete export, including its Date rows.")
+        blocks = f" Portfolio blocks declared: {', '.join(declared_portfolios)}." if declared_portfolios else ""
+        raise ValueError(
+            "No MT Quant trade legs were found. Upload the complete export, including its Date rows." + blocks
+        )
     return pd.DataFrame(trades, columns=BASE_COLUMNS)
 
 
