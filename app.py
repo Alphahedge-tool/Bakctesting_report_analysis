@@ -38,12 +38,13 @@ st.markdown(
       [data-testid="stSidebar"] { background:#101827; border-right:1px solid #263247; }
       [data-testid="stSidebar"] * { color:#eef4ff; }
       [data-testid="stSidebar"] input { color:#172033 !important; }
-      .hero { padding:1.35rem 1.55rem; border-radius:22px; color:white; margin-bottom:1.1rem;
-              background:radial-gradient(circle at 85% 15%,rgba(34,211,238,.32),transparent 28%),
-                         linear-gradient(120deg,#172554,#1d4ed8 58%,#0891b2);
-              box-shadow:0 20px 45px rgba(30,64,175,.18); }
-      .hero h1 { margin:0 0 .25rem; font-size:2.15rem; }
-      .hero p { margin:0; color:#dbeafe; max-width:760px; }
+      .block-container { padding-top:1.1rem; padding-bottom:2rem; }
+      .hero { display:flex; align-items:baseline; gap:.75rem; flex-wrap:wrap;
+              padding:.5rem .95rem; border-radius:11px; color:white; margin-bottom:.7rem;
+              background:linear-gradient(120deg,#172554,#1d4ed8 58%,#0891b2);
+              box-shadow:0 4px 14px rgba(30,64,175,.16); }
+      .hero h1 { margin:0; font-size:1.06rem; font-weight:700; letter-spacing:-.02em; }
+      .hero p { margin:0; color:#c7dcff; font-size:.78rem; }
       [data-testid="stMetric"] { background:rgba(255,255,255,.88); border:1px solid #e3eaf5;
         padding:1rem 1.05rem; border-radius:16px; box-shadow:0 8px 24px rgba(30,50,90,.06); }
       [data-testid="stMetricLabel"] { color:#667085; }
@@ -51,6 +52,13 @@ st.markdown(
       .hint { border:1px solid #dbe7ff; background:#f1f6ff; padding:.8rem 1rem; border-radius:12px; color:#344054; }
       .stDownloadButton button, .stButton button { border-radius:11px; font-weight:700; }
       div[data-testid="stDataFrame"] { border:1px solid #e4eaf3; border-radius:14px; overflow:hidden; }
+      .stTabs [data-baseweb="tab"] { padding:.35rem .85rem; }
+      .statrow { display:flex; flex-wrap:wrap; gap:.5rem; margin:.15rem 0 .8rem; }
+      .stat { flex:1 1 128px; background:rgba(255,255,255,.9); border:1px solid #e3eaf5;
+              border-radius:12px; padding:.5rem .7rem; }
+      .stat b { display:block; font-family:'Manrope',sans-serif; font-size:1.03rem; line-height:1.35; }
+      .stat span { font-size:.7rem; color:#667085; text-transform:uppercase; letter-spacing:.04em; }
+      .pos { color:#15803d; } .neg { color:#dc2626; } .neutral { color:#172033; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -301,6 +309,133 @@ def vix_regime_summary(
     return pd.DataFrame(rows)
 
 
+def _periods_per_year(dates) -> float:
+    """Observations per year implied by the data itself.
+
+    MT Quant exports are frequently weekly-expiry strategies (~52 sessions a
+    year). Annualising those on the usual 252 trading days would overstate
+    Sharpe by about 2.2x, so the cadence is measured rather than assumed.
+    """
+    ordered = pd.to_datetime(pd.Series(list(dates))).sort_values()
+    if len(ordered) < 2:
+        return float(len(ordered)) or 1.0
+    span_days = (ordered.iloc[-1] - ordered.iloc[0]).days
+    if span_days <= 0:
+        return float(len(ordered))
+    return len(ordered) / (span_days / 365.25)
+
+
+def _max_consecutive(flags: pd.Series) -> int:
+    """Longest run of True values (OpenStatz `_count_consecutive` approach)."""
+    if flags.empty:
+        return 0
+    runs = flags * (flags.groupby((flags != flags.shift(1)).cumsum()).cumcount() + 1)
+    return int(runs.max())
+
+
+def drawdown_series(pnl: pd.Series) -> pd.Series:
+    """Rupee drawdown of the cumulative P&L curve from its running peak."""
+    equity = pnl.cumsum()
+    return equity - equity.cummax()
+
+
+def performance_stats(frame: pd.DataFrame, column: str = "Net P&L After Charges") -> dict:
+    """Risk and return statistics for a daily P&L series.
+
+    Formulas follow OpenStatz / QuantStats conventions (sample std for Sharpe,
+    full-sample downside deviation for Sortino, wins-over-losses profit factor)
+    but are applied to rupee P&L rather than percentage returns, so no capital
+    base has to be assumed. Ratios are scale-free and therefore identical
+    either way; drawdown stays in rupees instead of percent.
+    """
+    pnl = pd.to_numeric(frame[column], errors="coerce").dropna()
+    stats = {"Sessions": len(pnl), "Periods/year": _periods_per_year(frame["Date"])}
+    if pnl.empty:
+        return stats
+
+    wins, losses = pnl[pnl > 0], pnl[pnl < 0]
+    traded = pnl[pnl != 0]
+    root = stats["Periods/year"] ** 0.5
+    std = pnl.std(ddof=1)
+    downside = ((pnl[pnl < 0] ** 2).sum() / len(pnl)) ** 0.5
+    drawdown = drawdown_series(pnl)
+    max_dd = float(drawdown.min())
+    avg_win = float(wins.mean()) if len(wins) else float("nan")
+    avg_loss = float(losses.mean()) if len(losses) else float("nan")
+    payoff = avg_win / abs(avg_loss) if len(losses) and avg_loss else float("nan")
+    win_rate = len(wins) / len(traded) if len(traded) else float("nan")
+    var95 = float(pnl.quantile(0.05))
+    tail = pnl[pnl <= var95]
+
+    stats.update({
+        "Net P&L": float(pnl.sum()),
+        "Expectancy": float(pnl.mean()),
+        "Win rate": win_rate,
+        "Sharpe": float(pnl.mean() / std * root) if std else float("nan"),
+        "Sortino": float(pnl.mean() / downside * root) if downside else float("nan"),
+        "Volatility": float(std * root) if pd.notna(std) else float("nan"),
+        "Max drawdown": max_dd,
+        "Recovery factor": abs(pnl.sum()) / abs(max_dd) if max_dd else float("nan"),
+        "Profit factor": float(wins.sum() / abs(losses.sum())) if len(losses) and losses.sum() else float("nan"),
+        "Payoff ratio": payoff,
+        "Kelly %": ((payoff * win_rate) - (1 - win_rate)) / payoff * 100 if payoff and pd.notna(payoff) else float("nan"),
+        "Average win": avg_win,
+        "Average loss": avg_loss,
+        "Best day": float(pnl.max()),
+        "Worst day": float(pnl.min()),
+        "VaR 95%": var95,
+        "CVaR 95%": float(tail.mean()) if len(tail) else float("nan"),
+        "Max win streak": _max_consecutive(pnl > 0),
+        "Max loss streak": _max_consecutive(pnl < 0),
+    })
+    return stats
+
+
+def stat_cards(items: list[tuple[str, str, str]]) -> str:
+    """Compact stat tiles. Each item is (label, value, tone) where tone is
+    'pos', 'neg' or 'neutral'."""
+    cards = "".join(
+        f'<div class="stat"><span>{label}</span><b class="{tone}">{value}</b></div>'
+        for label, value, tone in items
+    )
+    return f'<div class="statrow">{cards}</div>'
+
+
+def _tone(value: float) -> str:
+    if pd.isna(value):
+        return "neutral"
+    return "pos" if value > 0 else ("neg" if value < 0 else "neutral")
+
+
+def _num(value: float, spec: str = "{:,.2f}", suffix: str = "") -> str:
+    return "—" if pd.isna(value) else spec.format(value) + suffix
+
+
+# Order-book chips. Zerodha shows buys in blue and sells in a warm red, so the
+# side keeps that convention and calls/puts get their own green/red pair.
+CHIP_STYLES = {
+    "BUY": "background-color:#e8f0fe;color:#1a56db;font-weight:700;",
+    "SELL": "background-color:#fff1e6;color:#c2410c;font-weight:700;",
+    "CE": "background-color:#e7f6ec;color:#15803d;font-weight:700;",
+    "PE": "background-color:#fdeaea;color:#b91c1c;font-weight:700;",
+}
+
+
+def _side_chip(value) -> str:
+    return CHIP_STYLES.get(str(value).strip().upper(), "")
+
+
+def _option_chip(value) -> str:
+    return CHIP_STYLES.get(str(value).strip().upper(), "")
+
+
+def _pnl_text(value) -> str:
+    number = pd.to_numeric(value, errors="coerce")
+    if pd.isna(number) or number == 0:
+        return ""
+    return "color:#15803d;font-weight:600;" if number > 0 else "color:#b91c1c;font-weight:600;"
+
+
 def excel_bytes(detail, daily, rates):
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl", datetime_format="dd-mmm-yyyy") as writer:
@@ -343,7 +478,7 @@ def portfolio_excel_bytes(results, summary):
 st.markdown("""
 <section class="hero">
   <h1>Options Brokerage Studio</h1>
-  <p>Upload an MT Quant export and turn every original, stop-loss, target and re-entry leg into an auditable brokerage report.</p>
+  <p>MT Quant exports → auditable brokerage, P&amp;L and risk analytics.</p>
 </section>
 """, unsafe_allow_html=True)
 
@@ -731,19 +866,96 @@ if len(comparison_results) == 2:
 st.caption(f"Filtered result · {len(daily)} of {len(full_daily)} days · {detail.shape[0]} trade legs")
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["Overview", "VIX analysis", "Market regimes", "Daily breakdown", "Trade legs", "Charges audit"])
 with tab1:
+    stats = performance_stats(daily)
+    st.markdown(stat_cards([
+        ("Net P&L", _num(stats.get("Net P&L", float("nan")), "₹{:,.0f}"), _tone(stats.get("Net P&L", float("nan")))),
+        ("Win rate", _num(stats.get("Win rate", float("nan")) * 100, "{:.1f}", "%"), "neutral"),
+        ("Profit factor", _num(stats.get("Profit factor", float("nan")), "{:.2f}"), _tone(stats.get("Profit factor", 1) - 1)),
+        ("Sharpe", _num(stats.get("Sharpe", float("nan")), "{:.2f}"), _tone(stats.get("Sharpe", float("nan")))),
+        ("Sortino", _num(stats.get("Sortino", float("nan")), "{:.2f}"), _tone(stats.get("Sortino", float("nan")))),
+        ("Max drawdown", _num(stats.get("Max drawdown", float("nan")), "₹{:,.0f}"), "neg"),
+        ("Recovery factor", _num(stats.get("Recovery factor", float("nan")), "{:.2f}"), "neutral"),
+        ("Expectancy / session", _num(stats.get("Expectancy", float("nan")), "₹{:,.0f}"), _tone(stats.get("Expectancy", float("nan")))),
+    ]), unsafe_allow_html=True)
+
+    net_by_day = daily["Net P&L After Charges"]
     left, right = st.columns([1.6, 1])
     with left:
         fig = go.Figure()
-        fig.add_trace(go.Bar(x=daily["Date"], y=daily["Gross P&L"], name="Gross P&L", marker_color="#60a5fa"))
-        fig.add_trace(go.Scatter(x=daily["Date"], y=daily["Cumulative Net P&L"], name="Cumulative net P&L", yaxis="y2", line=dict(color="#0f766e", width=3)))
-        fig.update_layout(title="Performance after all charges", template="plotly_white", height=410, margin=dict(l=20,r=20,t=55,b=20),
-                          legend=dict(orientation="h", y=1.1), yaxis2=dict(overlaying="y", side="right", showgrid=False))
+        fig.add_trace(go.Bar(
+            x=daily["Date"], y=net_by_day, name="Net P&L",
+            marker_color=["#16a34a" if value >= 0 else "#dc2626" for value in net_by_day],
+            hovertemplate="%{x|%d-%b-%Y}<br>Net ₹%{y:,.0f}<extra></extra>",
+        ))
+        fig.add_trace(go.Scatter(
+            x=daily["Date"], y=daily["Cumulative Net P&L"], name="Cumulative net P&L",
+            yaxis="y2", line=dict(color="#0f172a", width=2.4),
+            hovertemplate="%{x|%d-%b-%Y}<br>Cumulative ₹%{y:,.0f}<extra></extra>",
+        ))
+        fig.add_hline(y=0, line_width=1, line_color="#94a3b8")
+        fig.update_layout(title="Net P&L by session · green above zero, red below", template="plotly_white",
+                          height=380, margin=dict(l=20, r=20, t=52, b=20), hovermode="x unified",
+                          legend=dict(orientation="h", y=1.12),
+                          yaxis2=dict(overlaying="y", side="right", showgrid=False))
         st.plotly_chart(fig, width="stretch")
     with right:
         charges = pd.Series({c: total[c] for c in ["Zerodha Brokerage", "STT", "NSE Transaction Charges", "SEBI Charges", "Stamp Duty", "GST"]})
         pie = go.Figure(go.Pie(labels=charges.index, values=charges.values, hole=.62, marker_colors=["#2563eb","#06b6d4","#8b5cf6","#64748b","#f59e0b","#14b8a6"]))
-        pie.update_layout(title="Charge composition", template="plotly_white", height=410, margin=dict(l=10,r=10,t=55,b=15), showlegend=True)
+        pie.update_layout(title="Charge composition", template="plotly_white", height=380, margin=dict(l=10,r=10,t=52,b=15), showlegend=True)
         st.plotly_chart(pie, width="stretch")
+
+    dd_col, heat_col = st.columns([1.6, 1])
+    with dd_col:
+        underwater = drawdown_series(net_by_day)
+        dd_fig = go.Figure(go.Scatter(
+            x=daily["Date"], y=underwater, fill="tozeroy", mode="lines",
+            line=dict(color="#dc2626", width=1.2), fillcolor="rgba(220,38,38,.18)",
+            hovertemplate="%{x|%d-%b-%Y}<br>Drawdown ₹%{y:,.0f}<extra></extra>",
+        ))
+        dd_fig.update_layout(title="Underwater curve · drawdown from peak", template="plotly_white",
+                             height=300, margin=dict(l=20, r=20, t=48, b=20), showlegend=False)
+        st.plotly_chart(dd_fig, width="stretch")
+    with heat_col:
+        monthly = daily.assign(
+            Year=daily["Date"].dt.year, Month=daily["Date"].dt.strftime("%b"),
+        ).pivot_table(index="Year", columns="Month", values="Net P&L After Charges", aggfunc="sum")
+        month_order = [m for m in ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"] if m in monthly.columns]
+        monthly = monthly[month_order]
+        limit = float(monthly.abs().max().max() or 1)
+        heat = go.Figure(go.Heatmap(
+            z=monthly.values, x=monthly.columns, y=monthly.index.astype(str),
+            colorscale=[[0, "#dc2626"], [0.5, "#f8fafc"], [1, "#16a34a"]],
+            zmid=0, zmin=-limit, zmax=limit, showscale=False,
+            hovertemplate="%{y} %{x}<br>₹%{z:,.0f}<extra></extra>",
+        ))
+        heat.update_layout(title="Monthly net P&L", template="plotly_white",
+                           height=300, margin=dict(l=10, r=10, t=48, b=20))
+        st.plotly_chart(heat, width="stretch")
+
+    with st.expander("Full risk and return statistics"):
+        st.caption(
+            f"Ratios annualised on {stats['Periods/year']:.0f} sessions per year, measured from the "
+            "export's own cadence — this is a weekly-expiry strategy, not a 252-day one. "
+            "Formulas follow OpenStatz / QuantStats conventions."
+        )
+        readable = {
+            "Sessions": "{:,.0f}", "Net P&L": "₹{:,.2f}", "Expectancy": "₹{:,.2f}",
+            "Sharpe": "{:.2f}", "Sortino": "{:.2f}", "Volatility": "₹{:,.2f}",
+            "Max drawdown": "₹{:,.2f}", "Recovery factor": "{:.2f}", "Profit factor": "{:.2f}",
+            "Payoff ratio": "{:.2f}", "Kelly %": "{:.1f}%", "Average win": "₹{:,.2f}",
+            "Average loss": "₹{:,.2f}", "Best day": "₹{:,.2f}", "Worst day": "₹{:,.2f}",
+            "VaR 95%": "₹{:,.2f}", "CVaR 95%": "₹{:,.2f}",
+            "Max win streak": "{:,.0f}", "Max loss streak": "{:,.0f}",
+        }
+        stats_table = pd.DataFrame(
+            [(name, "—" if pd.isna(stats.get(name, float("nan"))) else spec.format(stats[name]))
+             for name, spec in readable.items() if name in stats],
+            columns=["Metric", "Value"],
+        )
+        if "Win rate" in stats:
+            stats_table.loc[len(stats_table)] = ["Win rate", _num(stats["Win rate"] * 100, "{:.1f}", "%")]
+        st.dataframe(stats_table, width="stretch", hide_index=True, height=420)
+        st.caption("VaR / CVaR are historical (empirical 5th percentile of session P&L), not normal-parametric — option-selling P&L has a fat left tail that a normal fit understates.")
 
 with tab2:
     vleft, vright = st.columns([1.45, 1])
@@ -861,47 +1073,85 @@ with tab4:
     st.dataframe(display_daily.style.format({c: "₹{:,.2f}" for c in money_cols}), width="stretch", height=540, hide_index=True)
 
 with tab5:
-    st.subheader("Trade legs by VIX regime")
-    st.caption("Pick the VIX bands you want to inspect. Select `Low` and `Medium` to see the trades taken in lower-volatility sessions.")
-    vix_band_selection = st.multiselect(
-        "VIX band filter",
-        VIX_BAND_LABELS,
-        default=["Low · 12–15", "Medium · 15–18"],
-        help="Choose one or more VIX bands. Low and Medium are selected by default so you can focus on those trades first.",
-    )
-    portfolios = sorted(detail["Portfolio"].unique())
-    selected = st.multiselect("Portfolio blocks", portfolios, default=portfolios)
-    filtered = detail[detail["Portfolio"].isin(selected)].copy()
+    st.subheader("Order book")
+    fc1, fc2, fc3, fc4 = st.columns([1.5, 1.5, 1, 1])
+    with fc1:
+        portfolios = sorted(detail["Portfolio"].unique())
+        selected = st.multiselect("Portfolio blocks", portfolios, default=portfolios,
+                                  help="Hourly entry blocks (09:30 … 15:00) or re-entry blocks.")
+    with fc2:
+        vix_band_selection = st.multiselect(
+            "VIX band", VIX_BAND_LABELS, default=[],
+            help="Leave empty for every band.",
+        )
+    with fc3:
+        sides = sorted(detail["Transaction"].dropna().unique())
+        side_selection = st.multiselect("Side", sides, default=sides)
+    with fc4:
+        types = sorted(detail["Option Type"].dropna().unique())
+        type_selection = st.multiselect("Call / Put", types, default=types)
+
+    filtered = detail[
+        detail["Portfolio"].isin(selected)
+        & detail["Transaction"].isin(side_selection)
+        & detail["Option Type"].isin(type_selection)
+    ].copy()
     if market_available:
         filtered["VIX Band"] = _vix_band(filtered, vix_basis)
         if vix_band_selection:
             filtered = filtered[filtered["VIX Band"].astype(str).isin(vix_band_selection)]
-        st.caption("This table is now filtered to the VIX bands you picked above.")
-        regime_summary = vix_regime_summary(filtered, bands=vix_band_selection or None)
-        st.markdown("#### VIX regime summary")
-        st.caption("Each row shows how many trades were taken in that VIX band and whether the total net P&L was a profit or a loss.")
-        st.dataframe(
-            regime_summary.style.format({
-                "Gross P&L": MONEY,
-                "Charges": MONEY,
-                "Net P&L": MONEY,
-                "Best Day P&L": MONEY,
-                "Worst Day P&L": MONEY,
-            }),
-            width="stretch",
-            hide_index=True,
-        )
-    filtered["Date"] = filtered["Date"].dt.strftime("%d-%b-%Y")
-    money_cols = [
-        column for column in filtered.columns
-        if any(term in column for term in ["Premium", "P&L", "Brokerage", "STT", "Transaction Charges", "SEBI Charges", "Stamp Duty", "GST"])
-    ]
-    st.dataframe(
-        filtered.style.format({column: MONEY for column in money_cols}),
-        width="stretch",
-        height=560,
-        hide_index=True,
-    )
+
+    if filtered.empty:
+        st.warning("No legs match these filters. Widen the portfolio, side, call/put or VIX band selection.")
+    else:
+        leg_net = filtered["Net P&L After Charges"]
+        leg_wins = leg_net[leg_net > 0]
+        leg_losses = leg_net[leg_net < 0]
+        st.markdown(stat_cards([
+            ("Legs", f"{len(filtered):,}", "neutral"),
+            ("Net P&L", _num(float(leg_net.sum()), "₹{:,.0f}"), _tone(float(leg_net.sum()))),
+            ("Winners", f"{len(leg_wins):,}", "pos"),
+            ("Losers", f"{len(leg_losses):,}", "neg"),
+            ("Win rate", _num(len(leg_wins) / len(leg_net) * 100 if len(leg_net) else float("nan"), "{:.1f}", "%"), "neutral"),
+            ("Avg win", _num(float(leg_wins.mean()) if len(leg_wins) else float("nan"), "₹{:,.0f}"), "pos"),
+            ("Avg loss", _num(float(leg_losses.mean()) if len(leg_losses) else float("nan"), "₹{:,.0f}"), "neg"),
+            ("Charges", _num(float(filtered["Total Brokerage (Including All Charges)"].sum()), "₹{:,.0f}"), "neutral"),
+        ]), unsafe_allow_html=True)
+
+        if market_available:
+            with st.expander("VIX band breakdown"):
+                band_summary = vix_regime_summary(filtered, bands=vix_band_selection or None)
+                st.dataframe(
+                    band_summary.style.format({
+                        "Gross P&L": MONEY, "Charges": MONEY, "Net P&L": MONEY,
+                        "Best Day P&L": MONEY, "Worst Day P&L": MONEY,
+                    }),
+                    width="stretch", hide_index=True,
+                )
+
+        compact_columns = [
+            "Date", "Portfolio", "Leg", "Transaction", "Option Type", "Strike", "Expiry",
+            "Entry/Sell Premium", "Exit/Buy Premium", "Quantity", "Gross P&L",
+            "Total Brokerage (Including All Charges)", "Net P&L After Charges",
+            "Exit Reason", "Start Time", "End Time",
+        ]
+        show_all = st.toggle("Show every calculated column", value=False,
+                             help="Off by default so the book stays readable; turn on for the full charge breakdown.")
+        columns = list(filtered.columns) if show_all else [c for c in compact_columns if c in filtered.columns]
+
+        book = filtered[columns].copy()
+        book["Date"] = pd.to_datetime(book["Date"]).dt.strftime("%d-%b-%Y")
+        money_cols = [
+            column for column in book.columns
+            if any(term in column for term in ["Premium", "P&L", "Brokerage", "STT", "Transaction Charges", "SEBI Charges", "Stamp Duty", "GST"])
+        ]
+        styled = book.style.format({column: MONEY for column in money_cols})
+        styled = styled.map(_side_chip, subset=["Transaction"]).map(_option_chip, subset=["Option Type"])
+        for column in ["Gross P&L", "Net P&L After Charges"]:
+            if column in book.columns:
+                styled = styled.map(_pnl_text, subset=[column])
+        st.dataframe(styled, width="stretch", height=560, hide_index=True)
+        st.caption(f"{len(book):,} legs · {len(columns)} columns · BUY blue, SELL amber, CE green, PE red.")
 
 with tab6:
     audit = pd.DataFrame({
