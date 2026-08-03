@@ -59,6 +59,18 @@ st.markdown(
       .stat b { display:block; font-family:'Manrope',sans-serif; font-size:1.03rem; line-height:1.35; }
       .stat span { font-size:.7rem; color:#667085; text-transform:uppercase; letter-spacing:.04em; }
       .pos { color:#15803d; } .neg { color:#dc2626; } .neutral { color:#172033; }
+      .gridwrap { overflow-x:auto; }
+      .seasongrid { width:100%; border-collapse:separate; border-spacing:3px; }
+      .seasongrid th { color:#667085; font-weight:600; font-size:.66rem; text-transform:uppercase;
+                       letter-spacing:.04em; padding:.15rem 0; }
+      .seasongrid td { background:#f8fafc; border:1px solid #e4eaf3; border-radius:9px;
+                       padding:.34rem .25rem; text-align:center; min-width:62px; }
+      .seasongrid td.empty { background:transparent; border-color:transparent; }
+      .seasongrid b { display:block; font-family:'Manrope',sans-serif; font-size:.78rem; line-height:1.3; }
+      .seasongrid i { display:inline-block; margin-top:.2rem; padding:.03rem .34rem; border-radius:999px;
+                      font-style:normal; font-size:.6rem; font-weight:700; white-space:nowrap; }
+      .vixkey { display:flex; flex-wrap:wrap; gap:.35rem; margin:.4rem 0 .2rem; font-size:.66rem; }
+      .vixkey span { padding:.1rem .45rem; border-radius:999px; font-weight:700; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -495,6 +507,62 @@ def heatmap_figure(table: pd.DataFrame, title: str, height: int = 320) -> go.Fig
         xaxis=dict(side="bottom", type="category"),
     )
     return figure
+
+
+# VIX chips use a cool→hot ramp deliberately unlike the green/red P&L colours,
+# so a high-volatility month never reads as a losing one.
+VIX_CHIP_COLOURS = {
+    "Very Low · Below 12": ("#eff6ff", "#1d4ed8"),
+    "Low · 12–15": ("#e0e7ff", "#4338ca"),
+    "Medium · 15–18": ("#ede9fe", "#6d28d9"),
+    "High · 18–22": ("#fae8ff", "#a21caf"),
+    "Very High · Above 22": ("#fce7f3", "#be185d"),
+}
+
+
+def monthly_vix_stats(frame: pd.DataFrame, basis: str) -> pd.DataFrame:
+    """Lowest, highest and mean VIX per year-month, plus the mean's band."""
+    dates = pd.to_datetime(frame["Date"])
+    stats = frame.assign(_Year=dates.dt.year, _Month=dates.dt.month).groupby(
+        ["_Year", "_Month"]
+    )[basis].agg(["min", "max", "mean"])
+    stats["band"] = pd.cut(stats["mean"], bins=VIX_BINS, labels=VIX_BAND_LABELS, right=False)
+    return stats
+
+
+def seasonality_grid_html(pnl_table: pd.DataFrame, vix_stats: pd.DataFrame | None) -> str:
+    """Year × month grid where each cell carries the month's net P&L and, when
+    VIX is available, a chip showing the VIX range that produced it."""
+    header = "".join(f"<th>{label}</th>" for label in pnl_table.columns)
+    rows = []
+    for year, row in pnl_table.iterrows():
+        cells = []
+        for position, value in enumerate(row, start=1):
+            if pd.isna(value):
+                cells.append('<td class="empty"></td>')
+                continue
+            tone = "pos" if value > 0 else ("neg" if value < 0 else "neutral")
+            chip = ""
+            if vix_stats is not None and (year, position) in vix_stats.index:
+                entry = vix_stats.loc[(year, position)]
+                low, high = entry["min"], entry["max"]
+                if pd.notna(low) and pd.notna(high):
+                    background, colour = VIX_CHIP_COLOURS.get(str(entry["band"]), ("#f1f5f9", "#475569"))
+                    label = f"{low:.1f}" if abs(high - low) < 0.05 else f"{low:.1f}–{high:.1f}"
+                    chip = f'<i style="background:{background};color:{colour}" title="Mean VIX {entry["mean"]:.2f}">{label}</i>'
+            cells.append(f'<td><b class="{tone}">{compact_money(value)}</b>{chip}</td>')
+        rows.append(f"<tr><th>{year}</th>{''.join(cells)}</tr>")
+    body = "".join(rows)
+    return (f'<div class="gridwrap"><table class="seasongrid">'
+            f"<thead><tr><th></th>{header}</tr></thead><tbody>{body}</tbody></table></div>")
+
+
+def vix_chip_legend() -> str:
+    chips = "".join(
+        f'<span style="background:{background};color:{colour}">{label}</span>'
+        for label, (background, colour) in VIX_CHIP_COLOURS.items()
+    )
+    return f'<div class="vixkey">{chips}</div>'
 
 
 def histogram_bars(series: pd.Series, bins: int = 40) -> tuple[list, list, list, list]:
@@ -1204,7 +1272,19 @@ with season_tab:
                                margin=dict(l=10, r=10, t=52, b=20), showlegend=False)
         st.plotly_chart(year_fig, width="stretch")
 
-    with st.expander("Monthly net P&L as a table"):
+    st.markdown("#### Monthly net P&L with VIX context")
+    if market_available:
+        st.caption(f"Each cell shows the month's net P&L and, below it, the VIX range those sessions "
+                   f"traded in (lowest–highest {vix_basis.lower()}; hover for the monthly mean). "
+                   "Chip colour is the band of the monthly mean.")
+        st.markdown(vix_chip_legend(), unsafe_allow_html=True)
+        month_vix = monthly_vix_stats(daily, vix_basis)
+    else:
+        st.caption("Each cell shows the month's net P&L. Upload the original MT Quant CSV to see the VIX range per month.")
+        month_vix = None
+    st.markdown(seasonality_grid_html(monthly_table, month_vix), unsafe_allow_html=True)
+
+    with st.expander("Monthly figures in full rupees"):
         st.dataframe(
             monthly_table.style.format(lambda v: "—" if pd.isna(v) else MONEY.format(v))
             .map(_pnl_text),
